@@ -26,7 +26,12 @@ from reversecore_mcp.core.config import get_config
 from reversecore_mcp.core.decorators import log_execution
 from reversecore_mcp.core.error_handling import handle_tool_errors
 from reversecore_mcp.core.exceptions import ExecutionTimeoutError
-from reversecore_mcp.core.execution import execute_subprocess_async, prepare_sandbox_access
+from reversecore_mcp.core.execution import (
+    execute_subprocess_async,
+    prepare_sandbox_access,
+)
+from reversecore_mcp.core.extension import GhidraAnalysisContext
+from reversecore_mcp.core.extension_registry import get_extension_registry
 from reversecore_mcp.core.logging_config import get_logger
 from reversecore_mcp.core.metrics import track_metrics
 from reversecore_mcp.core.next_tool_hints import build_decompile_hints, finalize_hints
@@ -130,6 +135,10 @@ async def r2_decompile(
         return err
     validated = validate_file_path(file_path)
 
+    ctx = GhidraAnalysisContext(file_path=str(validated), function_address=function_address)
+    registry = get_extension_registry()
+    await registry.execute_headless_scripts(ctx)
+
     # Check cache first
     cached_res = await get_cached_decompile(validated, function_address, use_ghidra=True)
     pseudo_c: str | None = None
@@ -200,7 +209,11 @@ async def r2_decompile(
         )
         await set_cached_decompile(validated, function_address, full_cached_res, use_ghidra=True)
 
+    # Run Ghidra decompile post-processing hooks
+    pseudo_c = await registry.run_ghidra_decompile_hooks(ctx, pseudo_c)
+
     lines = pseudo_c.splitlines()
+
     total_lines = len(lines)
 
     # Extract function signature from first non-comment line
@@ -383,6 +396,10 @@ async def r2_analyze_function(
         return err
     validated = validate_file_path(file_path)
 
+    ctx = GhidraAnalysisContext(file_path=str(validated), function_address=function_address)
+    registry = get_extension_registry()
+    await registry.execute_headless_scripts(ctx)
+
     cmds = [
         f"s {function_address}",
         "afij",  # function info JSON
@@ -413,20 +430,25 @@ async def r2_analyze_function(
             hint="Verify the address is a valid function entry point.",
         )
 
-    return success(
-        {
-            "name": fn_info.get("name", function_address),
-            "offset": fn_info.get("offset", 0),
-            "size": fn_info.get("size", 0),
-            "complexity": fn_info.get("cc", 0),
-            "edges": fn_info.get("edges", 0),
-            "nbbs": fn_info.get("nbbs", 0),
-            "nlocals": fn_info.get("nlocals", 0),
-            "nargs": fn_info.get("nargs", 0),
-            "signature": fn_info.get("signature", ""),
-            "calltype": fn_info.get("calltype", ""),
-        }
-    )
+    fn_result = {
+        "name": fn_info.get("name", function_address),
+        "offset": fn_info.get("offset", 0),
+        "size": fn_info.get("size", 0),
+        "complexity": fn_info.get("cc", 0),
+        "edges": fn_info.get("edges", 0),
+        "nbbs": fn_info.get("nbbs", 0),
+        "nlocals": fn_info.get("nlocals", 0),
+        "nargs": fn_info.get("nargs", 0),
+        "signature": fn_info.get("signature", ""),
+        "calltype": fn_info.get("calltype", ""),
+    }
+
+    # Run Ghidra function analysis hooks
+    enriched_list = await registry.run_ghidra_function_hooks(ctx, [fn_result])
+    if enriched_list and isinstance(enriched_list, list):
+        fn_result = enriched_list[0]
+
+    return success(fn_result)
 
 
 # ---------------------------------------------------------------------------
@@ -595,7 +617,8 @@ async def r2_simulate_patch(
         cache_dir.resolve().relative_to(workspace)
     except ValueError:
         return failure(
-            "INVALID_WORKSPACE", "Workspace cache directory resolves outside the workspace"
+            "INVALID_WORKSPACE",
+            "Workspace cache directory resolves outside the workspace",
         )
 
     patch_copy: Path | None = None

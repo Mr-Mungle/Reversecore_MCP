@@ -385,7 +385,10 @@ class TestR2SimulatePatch:
             with patch(
                 "reversecore_mcp.tools.radare2.r2ghidra_tools.execute_subprocess_async",
                 new_callable=AsyncMock,
-                return_value=("0x401000  90 90  nop; nop\nint main() { return 0; }\n", 70),
+                return_value=(
+                    "0x401000  90 90  nop; nop\nint main() { return 0; }\n",
+                    70,
+                ),
             ) as mock_execute:
                 result = await r2_simulate_patch("/workspace/test.elf", "0x401000", "9090")
 
@@ -427,3 +430,147 @@ class TestR2SimulatePatch:
         assert result.error_code == "TIMEOUT"
         mock_execute.assert_awaited_once()
         assert source.read_bytes() == b"test binary"
+
+
+# ---------------------------------------------------------------------------
+# Ghidra Extension Integration tests (Issue #271)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestGhidraExtensionIntegration:
+    """Tests verifying GhidraExtensionPoint lifecycle hooks and headless scripts are wired into r2ghidra tools."""
+
+    @pytest.fixture(autouse=True)
+    def reset_registry(self):
+        from reversecore_mcp.core.extension_registry import get_extension_registry
+
+        reg = get_extension_registry()
+        reg.reset()
+        yield reg
+        reg.reset()
+
+    @pytest.mark.asyncio
+    async def test_decompile_hook_transforms_returned_code(
+        self, reset_registry, mock_r2_run, mock_validate_file_path
+    ):
+        """A registered Ghidra extension's on_after_decompile visibly transforms decompiled output."""
+        from reversecore_mcp.core.extension import GhidraExtensionPoint
+        from reversecore_mcp.tools.radare2.r2ghidra_tools import r2_decompile
+
+        class TransformDecompileExt(GhidraExtensionPoint):
+            name = "transform_decompile_ext"
+
+            async def on_after_decompile(self, ctx, decompiled_code):
+                return decompiled_code.replace("original_function", "transformed_function")
+
+        reset_registry.register_ghidra(TransformDecompileExt())
+        mock_r2_run.return_value = (
+            "void original_function() {\n    return;\n}\n",
+            60,
+        )
+
+        result = await r2_decompile("/workspace/test.elf", "original_function")
+        assert result.status == "success"
+        assert "transformed_function" in result.data["pseudo_c"]
+        assert "original_function" not in result.data["pseudo_c"]
+
+    @pytest.mark.asyncio
+    async def test_function_analysis_hook_enriches_result(
+        self, reset_registry, mock_r2_run, mock_validate_file_path
+    ):
+        """A registered Ghidra extension's on_after_function_analysis enriches function metadata."""
+        from reversecore_mcp.core.extension import GhidraExtensionPoint
+        from reversecore_mcp.tools.radare2.r2ghidra_tools import r2_analyze_function
+
+        class EnrichFunctionExt(GhidraExtensionPoint):
+            name = "enrich_function_ext"
+
+            async def on_after_function_analysis(self, ctx, functions):
+                for f in functions:
+                    f["analyst_tag"] = "SECURITY_CRITICAL"
+                return functions
+
+        reset_registry.register_ghidra(EnrichFunctionExt())
+        mock_r2_run.return_value = (
+            '{"name": "sym.crypto", "offset": 4096, "size": 64, "cc": 3}\n',
+            50,
+        )
+
+        result = await r2_analyze_function("/workspace/test.elf", "sym.crypto")
+        assert result.status == "success"
+        assert result.data["analyst_tag"] == "SECURITY_CRITICAL"
+        assert result.data["name"] == "sym.crypto"
+
+    @pytest.mark.asyncio
+    async def test_headless_scripts_execute_once_per_target(
+        self, reset_registry, mock_r2_run, mock_validate_file_path, tmp_path
+    ):
+        """Headless scripts requested by an extension execute once per target project."""
+        from reversecore_mcp.core.extension import GhidraExtensionPoint
+        from reversecore_mcp.tools.radare2.r2ghidra_tools import r2_decompile
+
+        counter_file = tmp_path / "script_counter.txt"
+        counter_file.write_text("0")
+
+        script_file = tmp_path / "sample_headless.py"
+        script_file.write_text(f"""
+from pathlib import Path
+c_path = Path({repr(str(counter_file))})
+count = int(c_path.read_text()) + 1
+c_path.write_text(str(count))
+""")
+
+        class HeadlessScriptExt(GhidraExtensionPoint):
+            name = "headless_script_ext"
+
+            def get_headless_scripts(self):
+                return [str(script_file)]
+
+        reset_registry.register_ghidra(HeadlessScriptExt())
+        mock_r2_run.return_value = ("int main() { return 0; }\n", 40)
+
+        # First call triggers script execution
+        res1 = await r2_decompile("/workspace/test.elf", "main")
+        assert res1.status == "success"
+        assert counter_file.read_text() == "1"
+
+        # Second call for the same file should NOT re-execute the script
+        res2 = await r2_decompile("/workspace/test.elf", "main")
+        assert res2.status == "success"
+        assert counter_file.read_text() == "1"
+
+    @pytest.mark.asyncio
+    async def test_extension_hook_failure_isolated(
+        self, reset_registry, mock_r2_run, mock_validate_file_path
+    ):
+        """Exceptions in Ghidra extension hooks do not abort decompile or function analysis."""
+        from reversecore_mcp.core.extension import GhidraExtensionPoint
+        from reversecore_mcp.tools.radare2.r2ghidra_tools import (
+            r2_analyze_function,
+            r2_decompile,
+        )
+
+        class FailingExt(GhidraExtensionPoint):
+            name = "failing_ext"
+
+            async def on_after_decompile(self, ctx, decompiled_code):
+                raise RuntimeError("Decompile hook crashed!")
+
+            async def on_after_function_analysis(self, ctx, functions):
+                raise RuntimeError("Function analysis hook crashed!")
+
+        reset_registry.register_ghidra(FailingExt())
+        mock_r2_run.return_value = ("int target() { return 1; }\n", 30)
+
+        decompile_res = await r2_decompile("/workspace/test.elf", "target")
+        assert decompile_res.status == "success"
+        assert "target" in decompile_res.data["pseudo_c"]
+
+        mock_r2_run.return_value = (
+            '{"name": "target", "offset": 100, "size": 10}\n',
+            40,
+        )
+        analysis_res = await r2_analyze_function("/workspace/test.elf", "target")
+        assert analysis_res.status == "success"
+        assert analysis_res.data["name"] == "target"

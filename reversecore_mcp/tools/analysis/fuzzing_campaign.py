@@ -32,7 +32,10 @@ from reversecore_mcp.core.exceptions import (
     ToolNotFoundError,
     ValidationError,
 )
-from reversecore_mcp.core.execution import execute_subprocess_async, prepare_sandbox_access
+from reversecore_mcp.core.execution import (
+    execute_subprocess_async,
+    prepare_sandbox_access,
+)
 from reversecore_mcp.core.logging_config import get_logger
 from reversecore_mcp.core.metrics import track_metrics
 from reversecore_mcp.core.result import ToolResult, failure, success
@@ -73,22 +76,26 @@ def _validate_afl_extra_args(extra_args: list[str]) -> None:
             raise ValueError(f"AFL option '{option}' is managed by Reversecore_MCP")
 
 
-def _crash_signature(crash_path: Path) -> str:
-    """Compute a content-based signature for deduplication.
+def _crash_signature(crash_path: Path, chunk_size: int = 65536) -> str:
+    """Compute a streaming SHA-256 content signature for crash input deduplication.
 
-    Uses first 4 KB of crash data + filename to create a stable hash.
-    This is intentionally simple — AFL++ already deduplicates crashes;
-    we just handle rare duplicates that slip through.
+    Streams the complete file in fixed-size chunks so large crash inputs do not need
+    to be loaded into memory all at once. This avoids erroneously collapsing crashes
+    that share an initial prefix (e.g. >=4 KiB) but differ in subsequent bytes.
 
     Args:
         crash_path: Path to the crash input file.
+        chunk_size: Size of chunks to read per iteration (default 64 KiB).
 
     Returns:
-        Hex-encoded SHA1 digest (12 chars) for quick comparison.
+        Hex-encoded SHA-256 digest of the entire file, or the file name if reading fails.
     """
     try:
-        data = crash_path.read_bytes()[:4096]
-        return hashlib.sha1(data).hexdigest()[:12]  # nosec B324
+        hasher = hashlib.sha256()
+        with crash_path.open("rb") as f:
+            while chunk := f.read(chunk_size):
+                hasher.update(chunk)
+        return hasher.hexdigest()
     except OSError:
         return crash_path.name
 
@@ -428,7 +435,8 @@ async def run_fuzzing_campaign(
         cache_dir.resolve().relative_to(workspace)
     except ValueError:
         return failure(
-            "INVALID_WORKSPACE", "Workspace cache directory resolves outside the workspace"
+            "INVALID_WORKSPACE",
+            "Workspace cache directory resolves outside the workspace",
         )
 
     with tempfile.TemporaryDirectory(prefix="rcmcp_afl_", dir=cache_dir) as tmp_root:

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import io
 import logging
+import os
+import shutil
+import tempfile
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -18,6 +21,23 @@ from reversecore_mcp.core.result import ToolResult, success
 from reversecore_mcp.core.security import validate_file_path
 
 logger = get_logger(__name__)
+
+
+def _prepare_run_rootfs(base_rootfs: Path, run_rootfs: Path) -> None:
+    """Populate run_rootfs with directory structure and links from base_rootfs."""
+    for root, dirs, files in os.walk(base_rootfs):
+        rel = Path(root).relative_to(base_rootfs)
+        dest_dir = run_rootfs / rel
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for d in dirs:
+            (dest_dir / d).mkdir(parents=True, exist_ok=True)
+        for f in files:
+            src_file = Path(root) / f
+            dest_file = dest_dir / f
+            try:
+                dest_file.symlink_to(src_file)
+            except OSError:
+                shutil.copy2(src_file, dest_file)
 
 
 def _detect_binary_type(file_path: Path) -> tuple[str, str]:
@@ -159,18 +179,25 @@ async def emulate_binary(
     ostype, archtype = _detect_binary_type(validated_path)
     logger.info("Detected binary as %s (%s)", ostype, archtype)
 
-    # 3. Configure mock rootfs
+    # 3. Configure base rootfs and per-run isolated scratch rootfs
     workspace_cache = get_config().workspace / ".cache" / "qiling_rootfs"
-    rootfs_path = workspace_cache / ostype / archtype
-    rootfs_path.mkdir(parents=True, exist_ok=True)
+    base_rootfs = workspace_cache / ostype / archtype
+    base_rootfs.mkdir(parents=True, exist_ok=True)
 
-    # Minimal OS directory structures
+    # Minimal OS directory structures in base rootfs
     if ostype == "linux":
-        (rootfs_path / "lib").mkdir(exist_ok=True)
-        (rootfs_path / "lib64").mkdir(exist_ok=True)
-        (rootfs_path / "etc").mkdir(exist_ok=True)
+        (base_rootfs / "lib").mkdir(exist_ok=True)
+        (base_rootfs / "lib64").mkdir(exist_ok=True)
+        (base_rootfs / "etc").mkdir(exist_ok=True)
     elif ostype == "windows":
-        (rootfs_path / "Windows" / "System32").mkdir(parents=True, exist_ok=True)
+        (base_rootfs / "Windows" / "System32").mkdir(parents=True, exist_ok=True)
+
+    # Create an isolated per-run rootfs so mocks/temporary files do not leak across runs
+    scratch_parent = get_config().workspace / ".cache" / "qiling_scratch"
+    scratch_parent.mkdir(parents=True, exist_ok=True)
+    run_rootfs = Path(tempfile.mkdtemp(prefix=f"qiling_{ostype}_{archtype}_", dir=scratch_parent))
+    _prepare_run_rootfs(base_rootfs, run_rootfs)
+    rootfs_path = run_rootfs
 
     # 4. Handle mock files setup
     if mock_files:
@@ -183,7 +210,7 @@ async def emulate_binary(
                 continue
             host_path.parent.mkdir(parents=True, exist_ok=True)
             host_path.write_text(content, encoding="utf-8")
-            logger.debug("Mocked file at %s inside rootfs", virt_path)
+            logger.debug("Mocked file at %s inside per-run rootfs", virt_path)
 
     # 5. Initialize execution logs capturing
     qiling_logger = logging.getLogger("qiling")
@@ -298,6 +325,10 @@ async def emulate_binary(
         raise EmulationError(f"Emulation failed: {e}")
 
     finally:
+        # Clean up per-run isolated rootfs
+        if "run_rootfs" in locals() and run_rootfs.exists():
+            shutil.rmtree(run_rootfs, ignore_errors=True)
+
         # Restore original logger state
         qiling_logger.handlers = original_handlers
         qiling_logger.setLevel(original_level)
