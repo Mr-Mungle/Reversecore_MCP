@@ -46,7 +46,7 @@ class TestCrashSignature:
         crash.write_bytes(b"AAAA" * 10)
         sig = _crash_signature(crash)
         assert isinstance(sig, str)
-        assert len(sig) == 12  # SHA1 truncated to 12 chars
+        assert len(sig) == 64  # SHA256 full hex digest
         assert all(c in "0123456789abcdef" for c in sig)
 
     def test_different_contents_differ(self, tmp_path):
@@ -62,6 +62,26 @@ class TestCrashSignature:
         c2 = tmp_path / "c2"
         c2.write_bytes(b"PAYLOAD")
         assert _crash_signature(c1) == _crash_signature(c2)
+
+    def test_identical_prefix_different_suffix_differ(self, tmp_path):
+        """Files sharing identical first 4096 bytes but different suffixes must have distinct signatures."""
+        prefix = b"P" * 4096
+        c1 = tmp_path / "crash_prefix_1"
+        c1.write_bytes(prefix + b"SUFFIX_ONE")
+        c2 = tmp_path / "crash_prefix_2"
+        c2.write_bytes(prefix + b"SUFFIX_TWO")
+
+        sig1 = _crash_signature(c1)
+        sig2 = _crash_signature(c2)
+        assert sig1 != sig2
+
+    def test_streaming_chunk_size(self, tmp_path):
+        """Streaming hash with smaller chunk_size behaves identically to default."""
+        crash = tmp_path / "large_payload"
+        crash.write_bytes(b"DATA" * 5000)
+        sig_default = _crash_signature(crash)
+        sig_small_chunk = _crash_signature(crash, chunk_size=128)
+        assert sig_default == sig_small_chunk
 
     @pytest.mark.parametrize("arg", ["-o=/tmp/out", "-i", "-f", "--output=/tmp/out", "--"])
     def test_rejects_path_redirecting_afl_options(self, arg):
@@ -123,6 +143,19 @@ class TestCollectCrashes:
 
         result = _collect_crashes(tmp_path, max_crashes=5)
         assert len(result) == 5
+
+    def test_collects_crashes_with_identical_prefix_and_different_suffix(self, tmp_path):
+        """Crash files with identical first 4096 bytes and different suffixes must both be preserved."""
+        crashes_dir = tmp_path / "crashes"
+        crashes_dir.mkdir()
+        prefix = b"\x90" * 4096
+        (crashes_dir / "crash_a").write_bytes(prefix + b"\xcc\xcc")
+        (crashes_dir / "crash_b").write_bytes(prefix + b"\x90\x90")
+
+        result = _collect_crashes(tmp_path)
+        assert len(result) == 2
+        names = {p.name for p in result}
+        assert names == {"crash_a", "crash_b"}
 
 
 class TestTriageCrashes:

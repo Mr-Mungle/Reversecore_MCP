@@ -136,3 +136,110 @@ class TestEmulateBinary:
             mock_ql.arch.regs.write.assert_called_with("rax", 10)
             mock_ql.arch.stack_push.assert_any_call(1)
             mock_ql.arch.stack_push.assert_any_call(2)
+
+    @pytest.mark.asyncio
+    @patch("reversecore_mcp.tools.analysis.emulation_tools.validate_file_path")
+    @patch("reversecore_mcp.tools.analysis.emulation_tools._detect_binary_type")
+    async def test_emulate_binary_rootfs_isolation_and_cleanup(
+        self, mock_detect, mock_validate_file_path, tmp_path, monkeypatch
+    ):
+        """Test that mock files are isolated per run, do not contaminate base rootfs, and are cleaned up."""
+        from reversecore_mcp.core.config import get_config
+
+        config = get_config()
+        monkeypatch.setattr(config, "workspace", tmp_path)
+
+        mock_validate_file_path.return_value = tmp_path / "sample.elf"
+        mock_detect.return_value = ("linux", "x86_64")
+
+        observed_rootfs_runs = []
+
+        mock_ql = MagicMock()
+        mock_ql.arch = MagicMock()
+        mock_ql.arch.regs = MagicMock()
+        mock_ql.arch.regs.read.return_value = 0
+
+        def fake_qiling_init(*args, **kwargs):
+            rootfs = Path(kwargs.get("rootfs", ""))
+            observed_rootfs_runs.append(
+                {
+                    "path": rootfs,
+                    "has_test_conf": (rootfs / "etc" / "test.conf").exists(),
+                    "conf_content": (
+                        (rootfs / "etc" / "test.conf").read_text()
+                        if (rootfs / "etc" / "test.conf").exists()
+                        else None
+                    ),
+                }
+            )
+            return mock_ql
+
+        mock_ql_class = MagicMock(side_effect=fake_qiling_init)
+        mock_qiling_module = MagicMock()
+        mock_qiling_module.Qiling = mock_ql_class
+        mock_qiling_const_module = MagicMock()
+
+        with patch.dict(
+            sys.modules,
+            {"qiling": mock_qiling_module, "qiling.const": mock_qiling_const_module},
+        ):
+            # Run A with mock file
+            res_a = await emulate_binary(
+                "sample.elf", mock_files={"/etc/test.conf": "config_payload_a"}
+            )
+            assert res_a.status == "success"
+
+            # Base rootfs should NOT have test.conf
+            base_rootfs = tmp_path / ".cache" / "qiling_rootfs" / "linux" / "x86_64"
+            assert not (base_rootfs / "etc" / "test.conf").exists()
+
+            # Run A's scratch rootfs should have had test.conf during run, but now be cleaned up
+            run_a_rootfs = observed_rootfs_runs[0]["path"]
+            assert observed_rootfs_runs[0]["has_test_conf"] is True
+            assert observed_rootfs_runs[0]["conf_content"] == "config_payload_a"
+            assert not run_a_rootfs.exists()
+
+            # Run B without mock files should NOT see Run A's test.conf
+            res_b = await emulate_binary("sample.elf")
+            assert res_b.status == "success"
+
+            assert len(observed_rootfs_runs) == 2
+            run_b_rootfs = observed_rootfs_runs[1]["path"]
+            assert observed_rootfs_runs[1]["has_test_conf"] is False
+            assert not run_b_rootfs.exists()
+
+    @pytest.mark.asyncio
+    @patch("reversecore_mcp.tools.analysis.emulation_tools.validate_file_path")
+    @patch("reversecore_mcp.tools.analysis.emulation_tools._detect_binary_type")
+    async def test_emulate_binary_rootfs_cleanup_on_error(
+        self, mock_detect, mock_validate_file_path, tmp_path, monkeypatch
+    ):
+        """Test that per-run scratch rootfs is cleaned up even when emulation raises an exception."""
+        from reversecore_mcp.core.config import get_config
+
+        config = get_config()
+        monkeypatch.setattr(config, "workspace", tmp_path)
+
+        mock_validate_file_path.return_value = tmp_path / "sample.elf"
+        mock_detect.return_value = ("linux", "x86_64")
+
+        created_rootfs_path = None
+
+        def erroring_qiling_init(*args, **kwargs):
+            nonlocal created_rootfs_path
+            created_rootfs_path = Path(kwargs.get("rootfs", ""))
+            raise RuntimeError("Engine explosion during setup")
+
+        mock_ql_class = MagicMock(side_effect=erroring_qiling_init)
+        mock_qiling_module = MagicMock()
+        mock_qiling_module.Qiling = mock_ql_class
+        mock_qiling_const_module = MagicMock()
+
+        with patch.dict(
+            sys.modules,
+            {"qiling": mock_qiling_module, "qiling.const": mock_qiling_const_module},
+        ):
+            res = await emulate_binary("sample.elf", mock_files={"/etc/test.conf": "dummy"})
+            assert res.status == "error"
+            assert created_rootfs_path is not None
+            assert not created_rootfs_path.exists()

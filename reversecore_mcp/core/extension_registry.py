@@ -83,6 +83,7 @@ class ExtensionRegistry:
     def __init__(self) -> None:
         self._r2_extensions: list[R2ExtensionPoint] = []
         self._ghidra_extensions: list[GhidraExtensionPoint] = []
+        self._executed_scripts: set[tuple[str, str]] = set()
         self._discovered: bool = False
 
     # =========================================================================
@@ -106,7 +107,9 @@ class ExtensionRegistry:
                 self._expand_r2_allowlist(startup_cmds)
         except Exception as exc:
             logger.debug(
-                "Failed to get startup commands during registration of %s: %s", ext.name, exc
+                "Failed to get startup commands during registration of %s: %s",
+                ext.name,
+                exc,
             )
 
         logger.info("✅ R2 extension registered: %s (priority=%d)", ext.name, ext.priority)
@@ -362,6 +365,25 @@ class ExtensionRegistry:
             except Exception as exc:
                 logger.debug("R2 session-close hook error in '%s': %s", ext.name, exc)
 
+    async def run_ghidra_project_open_hooks(self, ctx: GhidraAnalysisContext) -> None:
+        """Call ``on_project_open`` on all Ghidra extensions."""
+        for ext in self._ghidra_extensions:
+            try:
+                await ext.on_project_open(ctx)
+            except Exception as exc:
+                logger.error("Ghidra project open hook error in '%s': %s", ext.name, exc)
+
+    async def run_ghidra_before_analysis_hooks(
+        self, ctx: GhidraAnalysisContext
+    ) -> GhidraAnalysisContext:
+        """Chain all Ghidra ``on_before_analysis`` hooks."""
+        for ext in self._ghidra_extensions:
+            try:
+                ctx = await ext.on_before_analysis(ctx)
+            except Exception as exc:
+                logger.error("Ghidra before analysis hook error in '%s': %s", ext.name, exc)
+        return ctx
+
     async def run_ghidra_decompile_hooks(self, ctx: GhidraAnalysisContext, code: str) -> str:
         """
         Chain all Ghidra ``on_after_decompile`` hooks.
@@ -394,6 +416,56 @@ class ExtensionRegistry:
             except Exception as exc:
                 logger.error("Ghidra function hook error in '%s': %s", ext.name, exc)
         return functions
+
+    async def execute_headless_scripts(self, ctx: GhidraAnalysisContext) -> list[dict[str, Any]]:
+        """Execute headless scripts requested by Ghidra extensions for this analysis context.
+
+        Each script is executed at most once per target binary/file to avoid duplicate execution.
+        Script failures are isolated and returned as diagnostics.
+
+        Args:
+            ctx: Analysis context.
+
+        Returns:
+            List of execution results with script path, status, and error info.
+        """
+        results: list[dict[str, Any]] = []
+        for script_path_str in self.get_ghidra_startup_scripts():
+            target_key = (ctx.file_path, script_path_str)
+            if target_key in self._executed_scripts:
+                continue
+
+            script_path = Path(script_path_str)
+            if not script_path.is_file():
+                err_msg = f"Headless script not found: {script_path_str}"
+                logger.warning(err_msg)
+                results.append({"script": script_path_str, "status": "error", "error": err_msg})
+                continue
+
+            try:
+                globals_dict = {
+                    "__file__": str(script_path),
+                    "__name__": "__ghidra_script__",
+                    "ctx": ctx,
+                }
+                code_content = script_path.read_text(encoding="utf-8")
+                compiled = compile(code_content, str(script_path), "exec")
+                await asyncio.to_thread(exec, compiled, globals_dict)
+                self._executed_scripts.add(target_key)
+                results.append({"script": script_path_str, "status": "success", "error": None})
+                logger.info(
+                    "Executed Ghidra headless script '%s' for '%s'",
+                    script_path_str,
+                    ctx.file_path,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Headless script execution failed for '%s': %s",
+                    script_path_str,
+                    exc,
+                )
+                results.append({"script": script_path_str, "status": "error", "error": str(exc)})
+        return results
 
     # =========================================================================
     # Tool collection
@@ -461,6 +533,7 @@ class ExtensionRegistry:
         """Clear all registered extensions (mainly used in tests)."""
         self._r2_extensions.clear()
         self._ghidra_extensions.clear()
+        self._executed_scripts.clear()
         self._discovered = False
 
     # =========================================================================
