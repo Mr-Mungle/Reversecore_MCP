@@ -13,9 +13,10 @@ import json
 import re
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import lief
+from pydantic import Field
 
 from reversecore_mcp.core.config import get_config
 from reversecore_mcp.core.decorators import log_execution
@@ -393,7 +394,15 @@ def _analyze_binary_with_lief(file_path: Path, data: bytes | None = None) -> dic
 
 
 @log_execution()
-async def detect_packer(file_path: str) -> ToolResult:
+async def detect_packer(
+    file_path: Annotated[
+        str,
+        Field(
+            description="Path to the binary file to analyze for packers, compilers, and protectors (supports PE, ELF, Mach-O). Must reside within workspace.",
+            min_length=1,
+        ),
+    ],
+) -> ToolResult:
     """Detect packer, compiler, and protector using Shannon entropy, section heuristics, and signature matching.
 
     Args:
@@ -411,6 +420,8 @@ async def detect_packer(file_path: str) -> ToolResult:
                 "FILE_TOO_LARGE",
                 f"File size ({file_size} bytes) exceeds maximum allowed size ({max_file_size} bytes)",
                 hint="Set REVERSECORE_MAX_FILE_SIZE environment variable to increase limit",
+                recovery_hint="Increase REVERSECORE_MAX_FILE_SIZE or scan a smaller sample/subregion.",
+                retryable=False,
             )
     except (OSError, AttributeError):
         pass
@@ -419,7 +430,12 @@ async def detect_packer(file_path: str) -> ToolResult:
     try:
         data, file_size, is_sampled = _read_binary_sample(validated_path, max_scan_size)
     except OSError as exc:
-        return failure("FILE_READ_ERROR", f"Cannot read file: {exc}")
+        return failure(
+            "FILE_READ_ERROR",
+            f"Cannot read file: {exc}",
+            recovery_hint="Verify file permissions and ensure the file is not locked by another process.",
+            retryable=False,
+        )
 
     # 1. Whole-file Shannon Entropy
     overall_entropy = calculate_shannon_entropy(data)
@@ -525,6 +541,8 @@ async def detect_packer(file_path: str) -> ToolResult:
         "overlay": overlay_info,
         "reasons": scoring["reasons"],
         "detections": detections,
+        "backends_used": ["entropy", "signatures", "lief_or_fallback"]
+        + (["diec"] if diec_res else []),
         "provenance": provenance,
         "partial_analysis": provenance,
     }
@@ -555,7 +573,15 @@ async def detect_packer(file_path: str) -> ToolResult:
 
 
 @log_execution()
-async def detect_packer_deep(file_path: str) -> ToolResult:
+async def detect_packer_deep(
+    file_path: Annotated[
+        str,
+        Field(
+            description="Path to the binary file for comprehensive multi-factor deep scan (block entropy, overlay analysis, section heuristics, full byte signatures). Must reside within workspace.",
+            min_length=1,
+        ),
+    ],
+) -> ToolResult:
     """Deep scan combining block-level entropy, overlay analysis, section anomaly heuristics, and full signature scanning.
 
     Args:
@@ -573,6 +599,8 @@ async def detect_packer_deep(file_path: str) -> ToolResult:
                 "FILE_TOO_LARGE",
                 f"File size ({file_size} bytes) exceeds maximum allowed size ({max_file_size} bytes)",
                 hint="Set REVERSECORE_MAX_FILE_SIZE environment variable to increase limit",
+                recovery_hint="Increase REVERSECORE_MAX_FILE_SIZE or scan a smaller sample/subregion.",
+                retryable=False,
             )
     except (OSError, AttributeError):
         pass
@@ -581,7 +609,12 @@ async def detect_packer_deep(file_path: str) -> ToolResult:
     try:
         data, file_size, is_sampled = _read_binary_sample(validated_path, max_scan_size)
     except OSError as exc:
-        return failure("FILE_READ_ERROR", f"Cannot read file: {exc}")
+        return failure(
+            "FILE_READ_ERROR",
+            f"Cannot read file: {exc}",
+            recovery_hint="Verify file permissions and ensure the file is not locked by another process.",
+            retryable=False,
+        )
 
     # 1. Whole-file & Block-level Entropy Analysis
     overall_entropy = calculate_shannon_entropy(data)
@@ -703,6 +736,15 @@ async def detect_packer_deep(file_path: str) -> ToolResult:
         "raw_strings_sample": _extract_strings_sample(data, max_chars=2000),
         "reasons": scoring["reasons"],
         "detections": detections,
+        "backends_used": [
+            "entropy",
+            "block_entropy",
+            "signatures",
+            "lief_or_fallback",
+            "overlay",
+            "section_anomalies",
+        ]
+        + (["diec"] if diec_res else []),
         "provenance": {
             "is_sampled": is_sampled,
             "scan_policy": "bounded_window_sampling" if is_sampled else "full",

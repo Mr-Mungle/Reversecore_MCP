@@ -21,6 +21,7 @@ from reversecore_mcp.tools.analysis import (
     lief_tools,
     static_analysis,
 )
+from reversecore_mcp.tools.analysis.capa_tools import CapaOutputFormat
 from reversecore_mcp.tools.malware import dormant_detector, ioc_tools, yara_tools
 from reversecore_mcp.tools.radare2 import r2_analysis
 from reversecore_mcp.tools.radare2.r2ghidra_tools import (
@@ -566,7 +567,9 @@ def register_resources(mcp: FastMCP):
             capa_capabilities = []
             mitre_attack = []
             try:
-                capa_res = await capa_tools.run_capa(file_path=path, output_format="summary")
+                capa_res = await capa_tools.run_capa(
+                    file_path=path, output_format=CapaOutputFormat.SUMMARY
+                )
                 if capa_res.status == "success" and isinstance(capa_res.data, dict):
                     caps = capa_res.data.get("capabilities", [])
                     for c in caps[:20]:

@@ -353,6 +353,17 @@ async def _cleanup_old_files():
 # Initialize the FastMCP server with lifespan management
 mcp = FastMCP(name="Reversecore_MCP", lifespan=server_lifespan)
 
+# Modernize MCP protocol posture: suppress deprecated logging capability per ToolBench baseline
+_orig_get_capabilities = mcp._mcp_server.get_capabilities
+
+
+def _get_protocol_capabilities(notification_options, experimental_capabilities):
+    caps = _orig_get_capabilities(notification_options, experimental_capabilities)
+    return caps.model_copy(update={"logging": None})
+
+
+mcp._mcp_server.get_capabilities = _get_protocol_capabilities  # type: ignore[method-assign]
+
 # Register plugins dynamically
 import os  # noqa: E402
 

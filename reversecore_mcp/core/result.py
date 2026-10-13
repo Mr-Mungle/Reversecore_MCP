@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, TypedDict
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from typing_extensions import NotRequired
 
 # NextToolHint is defined here to avoid circular imports with core.next_tool_hints
@@ -102,11 +102,24 @@ class PaginationMeta(BaseModel):
     truncated: bool = False
 
 
+class ErrorInfo(BaseModel):
+    """Machine-readable structured error contract for agent reasoning and recovery."""
+
+    code: str
+    message: str
+    retryable: bool = False
+    recovery_hint: str | None = None
+
+
 class ToolSuccess(BaseModel):
     """Represents a successful tool invocation."""
 
+    ok: Literal[True] = True
     status: Literal["success"] = "success"
     data: Any
+    warnings: list[str] = []
+    error: None = None
+    meta: dict[str, Any] | None = None
     metadata: dict[str, Any] | None = None
     pagination: PaginationMeta | None = None
     recommended_next_tools: list[NextToolHint] | None = None
@@ -120,11 +133,25 @@ class ToolSuccess(BaseModel):
 class ToolError(BaseModel):
     """Represents a failed tool invocation."""
 
+    ok: Literal[False] = False
     status: Literal["error"] = "error"
     error_code: str
     message: str
     hint: str | None = None
+    error: ErrorInfo | None = None
+    warnings: list[str] = []
     details: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _ensure_error_info(self) -> ToolError:
+        if self.error is None:
+            self.error = ErrorInfo(
+                code=self.error_code,
+                message=self.message,
+                retryable=False,
+                recovery_hint=self.hint,
+            )
+        return self
 
 
 ToolResult = ToolSuccess | ToolError
@@ -135,6 +162,8 @@ def success(
     *,
     pagination: PaginationMeta | None = None,
     hints: list[NextToolHint] | None = None,
+    warnings: list[str] | None = None,
+    meta: dict[str, Any] | None = None,
     **metadata: Any,
 ) -> ToolSuccess:
     """Create a ToolSuccess instance with optional metadata, pagination, and next-tool hints.
@@ -143,11 +172,21 @@ def success(
         data: The primary result payload (string, dict, list, etc.).
         pagination: Optional PaginationMeta information for paginated/windowed responses.
         hints: Optional list of NextToolHint dicts to guide AI follow-up.
+        warnings: Optional list of non-fatal operational warnings.
+        meta: Optional metadata dictionary.
         **metadata: Additional key-value metadata attached to the result.
     """
+    eff_meta: dict[str, Any] = dict(meta or {})
+    if metadata:
+        eff_meta.update(metadata)
     return ToolSuccess(
+        ok=True,
+        status="success",
         data=data,
-        metadata=metadata or None,
+        warnings=warnings or [],
+        error=None,
+        meta=eff_meta or None,
+        metadata=eff_meta or None,
         pagination=pagination,
         recommended_next_tools=hints or None,
     )
@@ -157,12 +196,28 @@ def failure(
     error_code: str,
     message: str,
     hint: str | None = None,
+    *,
+    retryable: bool = False,
+    recovery_hint: str | None = None,
+    warnings: list[str] | None = None,
     **details: Any,
 ) -> ToolError:
-    """Create a ToolError instance with optional hint/details."""
+    """Create a ToolError instance with structured error contract and recovery guidance."""
+    eff_recovery_hint = recovery_hint or hint
+    eff_hint = hint or recovery_hint
+    error_obj = ErrorInfo(
+        code=error_code,
+        message=message,
+        retryable=retryable,
+        recovery_hint=eff_recovery_hint,
+    )
     return ToolError(
+        ok=False,
+        status="error",
         error_code=error_code,
         message=message,
-        hint=hint,
+        hint=eff_hint,
+        error=error_obj,
+        warnings=warnings or [],
         details=details or None,
     )

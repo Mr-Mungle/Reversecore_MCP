@@ -24,6 +24,82 @@ sys.path.insert(0, str(ROOT))
 TOOLS_DIR = ROOT / "reversecore_mcp" / "tools"
 DOCS_TOOLS_PATH = ROOT / "docs" / "TOOLS.md"
 README_PATH = ROOT / "README.md"
+TOOL_MANIFEST_PATH = ROOT / "tool_manifest.json"
+MCP_TOOLS_PATH = ROOT / "mcp-tools.json"
+
+COMMON_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "ok": {"type": "boolean", "description": "True if operation succeeded, False otherwise"},
+        "status": {"type": "string", "enum": ["success", "error"]},
+        "data": {
+            "type": ["object", "string", "array", "null"],
+            "description": "Structured analysis payload on success",
+        },
+        "error": {
+            "type": ["object", "null"],
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Stable error code (e.g. FILE_NOT_FOUND, VALIDATION_ERROR)",
+                },
+                "message": {"type": "string", "description": "Human-readable explanation"},
+                "retryable": {"type": "boolean", "description": "Whether the caller may retry"},
+                "recovery_hint": {
+                    "type": ["string", "null"],
+                    "description": "Actionable recovery advice",
+                },
+            },
+        },
+        "warnings": {"type": "array", "items": {"type": "string"}},
+        "metadata": {"type": ["object", "null"]},
+        "meta": {"type": ["object", "null"]},
+        "pagination": {
+            "type": ["object", "null"],
+            "properties": {
+                "page": {"type": "integer"},
+                "page_size": {"type": "integer"},
+                "total_items": {"type": "integer"},
+                "total_pages": {"type": "integer"},
+                "has_next": {"type": "boolean"},
+                "has_previous": {"type": "boolean"},
+            },
+        },
+        "recommended_next_tools": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["ok", "status"],
+}
+
+
+def _infer_tool_annotations(name: str) -> dict[str, Any]:
+    lower = name.lower()
+    destructive_kws = ("delete", "kill", "remove", "clear", "reset", "terminate")
+    is_destructive = any(kw in lower for kw in destructive_kws)
+
+    mutation_kws = (
+        "import",
+        "generate",
+        "create",
+        "write",
+        "patch",
+        "modify",
+        "add",
+        "set",
+        "save",
+        "build",
+    )
+    is_mutation = any(kw in lower for kw in mutation_kws) and not lower.startswith("export")
+
+    is_readonly = not is_destructive and not is_mutation
+    is_idempotent = is_readonly or ("import" in lower or "set" in lower)
+
+    return {
+        "readOnlyHint": is_readonly,
+        "destructiveHint": is_destructive,
+        "idempotentHint": is_idempotent,
+        "openWorldHint": False,
+    }
+
 
 # Plugin metadata and domain classification
 PLUGIN_METADATA: dict[str, dict[str, str]] = {
@@ -185,12 +261,16 @@ def _extract_tool_record(
         tag = f"`{prop_name}` ({ptype}{', req' if is_req else ''})"
         param_summary.append(tag)
 
+    annotations = _infer_tool_annotations(name)
+
     return {
         "name": name,
         "description": desc.strip().split("\n")[0],
         "full_description": desc.strip(),
         "plugin": plugin_name,
         "parameters": properties,
+        "input_schema": params,
+        "annotations": annotations,
         "required": list(required),
         "param_summary": ", ".join(param_summary) if param_summary else "*(none)*",
         "profiles": profiles,
@@ -246,10 +326,10 @@ def render_tools_markdown(catalog: dict[str, Any]) -> str:
         "",
         "| Profile | Tools | Primary Focus | Included Plugins |",
         "|---|:---:|---|---|",
-        "| `full` | **151** | Complete All-in-One Suite (Default) | All plugins |",
-        "| `static` | **97** | Reverse Engineering & Decompilation | `analysis`, `common`, `radare2`, `report`, `server` |",
-        "| `vuln-research` | **103** | Vulnerability Hunting & Exploitation | `analysis`, `source_auditor`, `cve_hunter`, `radare2`, `common`, `report`, `server` |",
-        "| `malware` | **65** | Threat Triage & Malware Analysis | `analysis`, `common`, `malware`, `deobfuscation`, `report`, `server` |",
+        "| `full` | **153** | Complete All-in-One Suite (Default) | All plugins |",
+        "| `static` | **99** | Reverse Engineering & Decompilation | `analysis`, `common`, `radare2`, `report`, `server` |",
+        "| `vuln-research` | **105** | Vulnerability Hunting & Exploitation | `analysis`, `source_auditor`, `cve_hunter`, `radare2`, `common`, `report`, `server` |",
+        "| `malware` | **67** | Threat Triage & Malware Analysis | `analysis`, `common`, `malware`, `deobfuscation`, `report`, `server` |",
         "| `forensics` | **57** | Digital & Memory Forensics | `forensics`, `memory`, `common`, `report`, `server` |",
         "",
         "📊 *For empirical context token savings, cold-start latency, and memory benchmarks across profiles, see [Profile Footprint Benchmark](benchmarks/profile_footprint.md).*",
@@ -367,6 +447,54 @@ def update_readme_tool_counts(readme_content: str, total_tools: int) -> str:
     return updated
 
 
+def build_manifest(catalog: dict[str, Any]) -> dict[str, Any]:
+    """Generate machine-readable tool manifest for crawlers and indexers."""
+    all_tools = catalog["all_tools"]
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "name": "reversecore_mcp",
+        "description": "Enterprise-grade MCP server for binary reverse engineering, decompilation, malware triage, and vulnerability hunting.",
+        "total_tools": len(all_tools),
+        "protocol_readiness": {
+            "mcp_version": "2024-11-05",
+            "fastmcp_version": "3.4.4",
+            "capabilities": {
+                "tools": {"listChanged": False},
+                "resources": {"subscribe": False, "listChanged": False},
+                "prompts": {"listChanged": False},
+            },
+            "deprecated_features_removed": ["logging_capability"],
+        },
+        "response_contract": COMMON_OUTPUT_SCHEMA,
+        "tools": [
+            {
+                "name": t["name"],
+                "description": t["full_description"],
+                "plugin": t["plugin"],
+                "profiles": t["profiles"],
+                "inputSchema": t.get("input_schema", {}),
+                "outputSchema": COMMON_OUTPUT_SCHEMA,
+                "annotations": t.get("annotations", {}),
+            }
+            for t in all_tools
+        ],
+    }
+
+
+def build_mcp_tools(catalog: dict[str, Any]) -> list[dict[str, Any]]:
+    """Generate standalone MCP tool list conforming to Model Context Protocol specification."""
+    return [
+        {
+            "name": t["name"],
+            "description": t["full_description"],
+            "inputSchema": t.get("input_schema", {}),
+            "outputSchema": COMMON_OUTPUT_SCHEMA,
+            "annotations": t.get("annotations", {}),
+        }
+        for t in catalog["all_tools"]
+    ]
+
+
 async def main_async() -> int:
     parser = argparse.ArgumentParser(description="Generate and check Reversecore MCP tool catalog")
     parser.add_argument(
@@ -386,6 +514,12 @@ async def main_async() -> int:
     current_readme = README_PATH.read_text(encoding="utf-8")
     expected_readme = update_readme_tool_counts(current_readme, total_tools)
 
+    manifest_data = build_manifest(catalog)
+    expected_manifest_json = json.dumps(manifest_data, indent=2) + "\n"
+
+    mcp_tools_data = build_mcp_tools(catalog)
+    expected_mcp_tools_json = json.dumps(mcp_tools_data, indent=2) + "\n"
+
     if args.check:
         drift_errors: list[str] = []
         if not DOCS_TOOLS_PATH.exists():
@@ -403,6 +537,32 @@ async def main_async() -> int:
                 f"{README_PATH} has stale tool counts or references. "
                 "Run 'python scripts/generate_tool_catalog.py' to synchronize."
             )
+
+        if not TOOL_MANIFEST_PATH.exists():
+            drift_errors.append(
+                f"Missing machine-readable manifest: {TOOL_MANIFEST_PATH}. "
+                "Run 'python scripts/generate_tool_catalog.py' to regenerate."
+            )
+        else:
+            existing_manifest = TOOL_MANIFEST_PATH.read_text(encoding="utf-8")
+            if existing_manifest != expected_manifest_json:
+                drift_errors.append(
+                    f"{TOOL_MANIFEST_PATH} is out of date with current tool registry. "
+                    "Run 'python scripts/generate_tool_catalog.py' to regenerate."
+                )
+
+        if not MCP_TOOLS_PATH.exists():
+            drift_errors.append(
+                f"Missing MCP tools manifest: {MCP_TOOLS_PATH}. "
+                "Run 'python scripts/generate_tool_catalog.py' to regenerate."
+            )
+        else:
+            existing_mcp_tools = MCP_TOOLS_PATH.read_text(encoding="utf-8")
+            if existing_mcp_tools != expected_mcp_tools_json:
+                drift_errors.append(
+                    f"{MCP_TOOLS_PATH} is out of date with current tool registry. "
+                    "Run 'python scripts/generate_tool_catalog.py' to regenerate."
+                )
 
         if drift_errors:
             for err in drift_errors:
@@ -422,6 +582,12 @@ async def main_async() -> int:
         print(f"✅ Synchronized tool counts in {README_PATH} ({total_tools} tools)")
     else:
         print(f"ℹ️ {README_PATH} tool counts are already up to date ({total_tools} tools)")
+
+    TOOL_MANIFEST_PATH.write_text(expected_manifest_json, encoding="utf-8")
+    print(f"✅ Generated {TOOL_MANIFEST_PATH} ({total_tools} tools)")
+
+    MCP_TOOLS_PATH.write_text(expected_mcp_tools_json, encoding="utf-8")
+    print(f"✅ Generated {MCP_TOOLS_PATH} ({total_tools} tools)")
 
     return 0
 

@@ -524,7 +524,9 @@ async def export_cache_by_hash(file_hash: str) -> dict:
 
 
 async def import_cache_data(
-    cache_data: dict[str, Any], target_file: Path | str | None = None
+    cache_data: dict[str, Any],
+    target_file: Path | str | None = None,
+    dry_run: bool = False,
 ) -> int:
     """Import cache data exported via export_cache_by_hash.
 
@@ -535,6 +537,7 @@ async def import_cache_data(
     Args:
         cache_data: Parsed rcpack object.
         target_file: Optional local binary to verify against the pack hash.
+        dry_run: If True, validate integrity and count without persisting to SQLite/Redis.
 
     Returns the number of imported entries.
 
@@ -618,6 +621,12 @@ async def import_cache_data(
         imported_metadata["cache_target_hash_verified"] = target_hash_verified
         result_data["metadata"] = imported_metadata
         normalized_entries.append((function_address, decompiler, json.dumps(result_data)))
+
+    if dry_run:
+        logger.info(
+            f"Dry run validated {len(normalized_entries)} cache entries for hash {file_hash}"
+        )
+        return len(normalized_entries)
 
     imported_count = 0
     client = get_redis_client()

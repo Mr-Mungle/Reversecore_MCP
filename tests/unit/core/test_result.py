@@ -71,13 +71,15 @@ class TestToolSuccess:
 
     def test_success_dump(self):
         result = ToolSuccess(data="output", metadata={"key": "value"})
-        assert result.model_dump() == {
-            "status": "success",
-            "data": "output",
-            "metadata": {"key": "value"},
-            "pagination": None,
-            "recommended_next_tools": None,
-        }
+        dump = result.model_dump()
+        assert dump["ok"] is True
+        assert dump["status"] == "success"
+        assert dump["data"] == "output"
+        assert dump["metadata"] == {"key": "value"}
+        assert dump["pagination"] is None
+        assert dump["recommended_next_tools"] is None
+        assert dump["warnings"] == []
+        assert dump["error"] is None
 
 
 class TestToolError:
@@ -85,11 +87,15 @@ class TestToolError:
 
     def test_error_creation(self):
         result = ToolError(error_code="TEST", message="failure")
+        assert result.ok is False
         assert result.status == "error"
         assert result.error_code == "TEST"
         assert result.message == "failure"
         assert result.hint is None
         assert result.details is None
+        assert result.error is not None
+        assert result.error.code == "TEST"
+        assert result.error.message == "failure"
 
     def test_error_with_hint_and_details(self):
         result = ToolError(
@@ -99,8 +105,12 @@ class TestToolError:
             details={"path": "/tmp"},
         )
         dump = result.model_dump()
+        assert dump["ok"] is False
         assert dump["hint"] == "Check path"
         assert dump["details"] == {"path": "/tmp"}
+        assert dump["error"]["code"] == "VALIDATION_ERROR"
+        assert dump["error"]["recovery_hint"] == "Check path"
+        assert dump["error"]["retryable"] is False
 
 
 class TestHelperFactories:
