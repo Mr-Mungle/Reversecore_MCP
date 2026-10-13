@@ -25,3 +25,6 @@ CVE-2025-15661 exp:2026-10-15
 CVE-2026-58051 exp:2026-10-15
 CVE-2026-66032 exp:2026-10-15
 CVE-2026-66034 exp:2026-10-15
+
+# Mako template engine: Windows-only path traversal via drive-letter URI in TemplateLookup (container environment is Debian Linux)
+CVE-2026-102991
