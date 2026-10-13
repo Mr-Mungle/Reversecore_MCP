@@ -36,12 +36,21 @@ def _handle_exception(exc: Exception, tool_name: str) -> ToolResult:
     """
     if isinstance(exc, ToolNotFoundError):
         hint = f"Install with: apt-get install {exc.tool_name}"
-        return failure("TOOL_NOT_FOUND", str(exc), hint=hint)
+        return failure(
+            "TOOL_NOT_FOUND",
+            str(exc),
+            hint=hint,
+            retryable=False,
+            recovery_hint=f"Required tool '{exc.tool_name}' is missing. Install it on host PATH or execute inside the official Docker container.",
+        )
 
     if isinstance(exc, ExecutionTimeoutError):
         return failure(
             "TIMEOUT",
             f"Command timed out after {exc.timeout_seconds} seconds",
+            hint="Retry with a smaller binary scope, specific function address, or increase timeout.",
+            retryable=True,
+            recovery_hint="Operation timed out. Retry the analysis targeting a specific function address, increase tool_timeout, or analyze a smaller scope.",
             timeout_seconds=exc.timeout_seconds,
         )
 
@@ -50,6 +59,8 @@ def _handle_exception(exc: Exception, tool_name: str) -> ToolResult:
             "OUTPUT_LIMIT",
             str(exc),
             hint="Reduce output size or increase the limit",
+            retryable=False,
+            recovery_hint="Output size exceeded buffer limits. Use pagination parameters (e.g. page, page_size, limit) or narrower filter criteria.",
             details={
                 "max_size": exc.max_size,
                 "actual_size": exc.actual_size,
@@ -61,6 +72,8 @@ def _handle_exception(exc: Exception, tool_name: str) -> ToolResult:
             "VALIDATION_ERROR",
             str(exc),
             hint="Ensure the file is in the workspace directory",
+            retryable=False,
+            recovery_hint="Input parameter validation failed. Ensure the target path exists and resolves strictly within the authorized workspace.",
             details=exc.details,
         )
 
@@ -69,6 +82,8 @@ def _handle_exception(exc: Exception, tool_name: str) -> ToolResult:
             "EMULATION_ERROR",
             str(exc),
             hint="Ensure Qiling is installed and the target binary is supported.",
+            retryable=False,
+            recovery_hint="Emulation failed. Verify CPU architecture, rootfs availability, and executable format compatibility.",
         )
 
     # Generic exception handler
@@ -76,6 +91,9 @@ def _handle_exception(exc: Exception, tool_name: str) -> ToolResult:
     return failure(
         "INTERNAL_ERROR",
         f"{tool_name} failed: {exc}",
+        hint="Check tool logs or run with mock/triage tools.",
+        retryable=False,
+        recovery_hint="An unexpected analysis failure occurred. Inspect the server log or run an alternative static scan.",
         exception_type=exc.__class__.__name__,
     )
 

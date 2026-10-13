@@ -6,7 +6,10 @@ providing high-level behavioral information like encryption, file deletion, etc.
 """
 
 import asyncio
-from typing import Any
+from enum import Enum
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from reversecore_mcp.core.decorators import log_execution
 from reversecore_mcp.core.logging_config import get_logger
@@ -16,6 +19,14 @@ from reversecore_mcp.core.result import ToolResult, ToolSuccess, failure, succes
 from reversecore_mcp.core.security import validate_file_path
 
 logger = get_logger(__name__)
+
+
+class CapaOutputFormat(str, Enum):
+    """Output format detail level for CAPA capability detection."""
+
+    SUMMARY = "summary"
+    DETAILED = "detailed"
+    JSON = "json"
 
 
 def _is_capa_available() -> bool:
@@ -30,9 +41,22 @@ def _is_capa_available() -> bool:
 
 @log_execution()
 @circuit_breaker(tool_name="capa", failure_threshold=3, recovery_timeout=45)
-async def run_capa(file_path: str, output_format: str = "summary") -> ToolResult:
-    """
-    Analyze binary capabilities using CAPA (Mandiant FLARE).
+async def run_capa(
+    file_path: Annotated[
+        str,
+        Field(
+            description="Path to the binary file to analyze (supports PE, ELF, Mach-O, shellcode). Must reside within the allowed workspace.",
+            min_length=1,
+        ),
+    ],
+    output_format: Annotated[
+        CapaOutputFormat,
+        Field(
+            description="Output detail level: 'summary' for high-level capability list & MITRE ATT&CK techniques, 'detailed' for expanded rule-level context & MBC mappings, or 'json' for raw structured CAPA output.",
+        ),
+    ] = CapaOutputFormat.SUMMARY,
+) -> ToolResult:
+    """Analyze binary capabilities using CAPA (Mandiant FLARE).
 
     CAPA identifies capabilities in executable files and provides high-level
     behavioral information such as:
@@ -41,22 +65,50 @@ async def run_capa(file_path: str, output_format: str = "summary") -> ToolResult
     - "communicate via HTTP"
     - "create persistence via registry"
 
+    Supported binary formats: PE, ELF, Mach-O, and raw shellcode.
+    Analysis engine: Mandiant CAPA with vivisect backend.
+    Execution behavior: Disassembly of functions can be CPU-intensive on binaries >50MB.
+
     Args:
-        file_path: Path to the binary file to analyze
-        output_format: Output format - "summary" (default), "detailed", or "json"
+        file_path: Path to the binary file to analyze within workspace.
+        output_format: Output format - 'summary' (default), 'detailed', or 'json'.
 
     Returns:
-        ToolResult with capability analysis including:
-        - capabilities: List of detected capabilities
-        - mitre_attack: MITRE ATT&CK technique mappings
-        - mbc: Malware Behavior Catalog mappings
+        ToolResult with capability analysis, MITRE ATT&CK mappings, and diagnostic hints.
     """
-    validated_path = validate_file_path(file_path)
+    fmt_val = (
+        output_format.value
+        if isinstance(output_format, CapaOutputFormat)
+        else str(output_format).lower()
+    )
+    if fmt_val not in ("summary", "detailed", "json"):
+        return failure(
+            error_code="VALIDATION_ERROR",
+            message=f"Invalid output_format '{output_format}'. Supported formats: 'summary', 'detailed', 'json'.",
+            hint="Use one of: summary, detailed, json",
+            retryable=False,
+            recovery_hint="Specify output_format as 'summary' (compact reasoning), 'detailed' (full rules & ATT&CK), or 'json' (raw dump).",
+        )
+
+    try:
+        validated_path = validate_file_path(file_path)
+    except Exception as val_err:
+        return failure(
+            error_code="VALIDATION_ERROR",
+            message=f"File validation failed: {val_err}",
+            hint="Ensure file_path resolves within the authorized workspace directory.",
+            retryable=False,
+            recovery_hint="Ensure the path does not escape the workspace directory.",
+        )
 
     if not _is_capa_available():
         return failure(
             error_code="CAPA_NOT_INSTALLED",
             message="CAPA is not installed. Install with: pip install flare-capa",
+            hint="Install flare-capa or run the server inside the official container environment.",
+            retryable=False,
+            recovery_hint="Install flare-capa via 'pip install flare-capa' or launch the official Docker image.",
+            details={"dependency": "flare-capa", "standard_code": "DEPENDENCY_UNAVAILABLE"},
         )
 
     try:
@@ -113,13 +165,28 @@ async def run_capa(file_path: str, output_format: str = "summary") -> ToolResult
         for rule_name, matches in capabilities.items():
             rule = rules[rule_name]
 
-            capability = {
+            capability: dict[str, Any] = {
                 "name": rule_name,
                 "namespace": rule.meta.get("namespace", ""),
                 "description": rule.meta.get("description", ""),
                 "scope": rule.meta.get("scope", "function"),
                 "match_count": len(matches),
             }
+
+            if fmt_val == "detailed":
+                locations = []
+                for m in matches:
+                    if hasattr(m, "address"):
+                        locations.append(hex(m.address))
+                    elif isinstance(m, int):
+                        locations.append(hex(m))
+                    else:
+                        locations.append(str(m))
+                capability["matches"] = locations
+                if "authors" in rule.meta:
+                    capability["authors"] = rule.meta["authors"]
+                if "examples" in rule.meta:
+                    capability["examples"] = rule.meta["examples"]
 
             # Extract MITRE ATT&CK
             if "att&ck" in rule.meta:
@@ -202,9 +269,16 @@ async def run_capa(file_path: str, output_format: str = "summary") -> ToolResult
 
 
 @log_execution()
-async def run_capa_quick(file_path: str) -> ToolResult:
-    """
-    Quick CAPA scan returning only high-risk capabilities.
+async def run_capa_quick(
+    file_path: Annotated[
+        str,
+        Field(
+            description="Path to the binary file to analyze (supports PE, ELF, Mach-O, shellcode). Must reside within workspace.",
+            min_length=1,
+        ),
+    ],
+) -> ToolResult:
+    """Quick CAPA scan returning only high-risk capabilities.
 
     Faster than full run_capa, focuses on:
     - Anti-analysis techniques

@@ -35,6 +35,7 @@ class _LazyModule(ModuleType):
 # Keep them as proxies so optional analysis extras are only required when the
 # corresponding resource is actually used.
 _LAZY_RESOURCE_MODULES: Final[dict[str, str]] = {
+    "cache_tools": "reversecore_mcp.tools.analysis.cache_tools",
     "capa_tools": "reversecore_mcp.tools.analysis.capa_tools",
     "die_tools": "reversecore_mcp.tools.analysis.die_tools",
     "lief_tools": "reversecore_mcp.tools.analysis.lief_tools",
@@ -61,6 +62,10 @@ class AnalysisToolsPlugin(Plugin):
         # Import tool functions from submodules
         from reversecore_mcp.tools.analysis.advanced_yara import (
             generate_advanced_yara_rule,
+        )
+        from reversecore_mcp.tools.analysis.cache_tools import (
+            export_analysis_cache,
+            import_analysis_cache,
         )
         from reversecore_mcp.tools.analysis.capa_tools import (
             run_capa,
@@ -119,6 +124,8 @@ class AnalysisToolsPlugin(Plugin):
         mcp_server.tool(extract_rtti_info)
         mcp_server.tool(detect_packer)
         mcp_server.tool(detect_packer_deep)
+        mcp_server.tool(export_analysis_cache)
+        mcp_server.tool(import_analysis_cache)
         mcp_server.tool(run_capa)
         mcp_server.tool(run_capa_quick)
         mcp_server.tool(emulate_binary)
@@ -130,7 +137,7 @@ class AnalysisToolsPlugin(Plugin):
         mcp_server.tool(taint_trace)
         mcp_server.tool(vt_lookup)
 
-        logger.info(f"Registered {self.name} plugin with 27 analysis tools (unified)")
+        logger.info(f"Registered {self.name} plugin with 29 analysis tools (unified)")
 
 
 __all__ = ["AnalysisToolsPlugin", *_LAZY_RESOURCE_MODULES]
