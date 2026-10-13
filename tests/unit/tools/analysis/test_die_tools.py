@@ -277,6 +277,98 @@ class TestBinaryOverlayInspection:
         )
         assert res["has_overlay"] is True
         assert res["payload_type"] == "Authenticode_Signature"
+        assert res["certificate"] is not None
+        assert res["certificate"]["offset"] == 1024
+        assert res["certificate"]["size"] == 256
+        assert res["trailing_payload"] is None
+
+    def test_authenticode_with_alignment_padding_not_promoted(self):
+        cert = struct.pack("<IHH", 256, 0x0200, 0x0002) + (b"\xaa" * 248)
+        # 16 bytes of pure null alignment padding after certificate
+        data = b"MZ" + b"\x00" * 1022 + cert + (b"\x00" * 16)
+        res = inspect_binary_overlay(
+            None,
+            data,
+            {
+                "physical_extent": 1024,
+                "security_directory": {"offset": 1024, "size": 256},
+            },
+        )
+        assert res["has_overlay"] is True
+        assert res["payload_type"] == "Authenticode_Signature"
+        assert res["certificate"] is not None
+        assert res["trailing_payload"] is None
+
+    def test_authenticode_with_appended_zip_payload(self):
+        cert = struct.pack("<IHH", 256, 0x0200, 0x0002) + (b"\xaa" * 248)
+        zip_data = b"PK\x03\x04" + b"\x00" * 128
+        data = b"MZ" + b"\x00" * 1022 + cert + zip_data
+        res = inspect_binary_overlay(
+            None,
+            data,
+            {
+                "physical_extent": 1024,
+                "security_directory": {"offset": 1024, "size": 256},
+            },
+        )
+        assert res["has_overlay"] is True
+        assert res["certificate"] is not None
+        assert res["certificate"]["offset"] == 1024
+        assert res["certificate"]["size"] == 256
+        assert res["trailing_payload"] is not None
+        assert res["trailing_payload"]["payload_type"] == "ZIP_Archive"
+        assert res["trailing_payload"]["offset"] == 1280
+        assert res["trailing_payload"]["size"] == len(zip_data)
+        assert res["payload_type"] == "ZIP_Archive"
+
+    def test_authenticode_with_appended_high_entropy_blob(self):
+        cert = struct.pack("<IHH", 256, 0x0200, 0x0002) + (b"\xaa" * 248)
+        blob = bytes(range(256)) * 4
+        data = b"MZ" + b"\x00" * 1022 + cert + blob
+        res = inspect_binary_overlay(
+            None,
+            data,
+            {
+                "physical_extent": 1024,
+                "security_directory": {"offset": 1024, "size": 256},
+            },
+        )
+        assert res["has_overlay"] is True
+        assert res["certificate"] is not None
+        assert res["trailing_payload"] is not None
+        assert res["trailing_payload"]["payload_type"] == "Encrypted_or_Compressed_Blob"
+        assert res["payload_type"] == "Encrypted_or_Compressed_Blob"
+
+    def test_heuristic_win_certificate_dw_length_out_of_bounds(self):
+        # dwLength is 99999, which exceeds overlay size
+        bogus_cert = struct.pack("<IHH", 99999, 0x0200, 0x0002) + (b"\xaa" * 64)
+        data = b"MZ" + b"\x00" * 1022 + bogus_cert
+        res = inspect_binary_overlay(None, data, {"physical_extent": 1024})
+        assert res["has_overlay"] is True
+        assert res["certificate"] is None
+        assert res["payload_type"] != "Authenticode_Signature"
+
+    def test_heuristic_win_certificate_dw_length_too_small(self):
+        # dwLength is 4, which is less than header size (8)
+        bogus_cert = struct.pack("<IHH", 4, 0x0200, 0x0002) + (b"\xaa" * 64)
+        data = b"MZ" + b"\x00" * 1022 + bogus_cert
+        res = inspect_binary_overlay(None, data, {"physical_extent": 1024})
+        assert res["has_overlay"] is True
+        assert res["certificate"] is None
+        assert res["payload_type"] != "Authenticode_Signature"
+
+    def test_heuristic_win_certificate_with_trailing_payload(self):
+        # Valid heuristic cert followed by ZIP
+        cert = struct.pack("<IHH", 64, 0x0200, 0x0002) + (b"\xaa" * 56)
+        zip_data = b"PK\x03\x04" + b"\x00" * 64
+        data = b"MZ" + b"\x00" * 1022 + cert + zip_data
+        res = inspect_binary_overlay(None, data, {"physical_extent": 1024})
+        assert res["has_overlay"] is True
+        assert res["certificate"] is not None
+        assert res["certificate"]["size"] == 64
+        assert res["trailing_payload"] is not None
+        assert res["trailing_payload"]["payload_type"] == "ZIP_Archive"
+        assert res["payload_type"] == "ZIP_Archive"
 
     def test_high_entropy_blob_overlay(self):
         high_ent = bytes(range(256)) * 4
@@ -702,3 +794,87 @@ class TestDiecCliIntegration:
     @patch("shutil.which", return_value=None)
     def test_diec_cli_not_found(self, mock_which):
         assert _run_diec_cli_if_available(Path("dummy")) is None
+
+
+class TestIssue344BoundedPackerScanning:
+    """Tests for Issue #344: Bounded detect_packer string and signature scanning."""
+
+    @pytest.fixture(autouse=True)
+    def bypass_path_validation(self):
+        with patch(
+            "reversecore_mcp.tools.analysis.die_tools.validate_file_path",
+            side_effect=lambda p, **kw: Path(p),
+        ):
+            yield
+
+    def test_extract_strings_sample_bounded(self):
+        """String sampling must bound output to max_chars and not process whole buffer."""
+        from reversecore_mcp.tools.analysis.die_tools import _extract_strings_sample
+
+        huge_data = b"Hello world this is a test string for sampling. " * 50_000  # ~2.5MB
+        sample = _extract_strings_sample(huge_data, max_chars=500)
+        assert len(sample) <= 500
+        assert "Hello world" in sample
+
+    def test_signature_crossing_chunk_boundary_detected(self):
+        """Cross-chunk packer signatures must be detected using overlapping scan."""
+        from reversecore_mcp.tools.analysis.die_tools import _scan_signatures_chunked
+
+        # Place UPX! across boundary of chunk_size=1024 (at offset 1022)
+        chunk_size = 1024
+        overlap = 128
+        prefix = b"A" * (chunk_size - 2)
+        signature = b"UPX!"
+        suffix = b"B" * 1024
+        data = prefix + signature + suffix
+
+        packers, compilers, detections = _scan_signatures_chunked(
+            data, chunk_size=chunk_size, overlap=overlap
+        )
+        assert "UPX" in packers
+        assert any(d["value"] == "UPX" for d in detections)
+
+    @pytest.mark.asyncio
+    async def test_large_printable_fixture_bounded_memory_and_sampling(self, tmp_path):
+        """Large printable fixture must use bounded sampling and provide provenance."""
+        large_file = tmp_path / "large_printable.exe"
+        # 25 MB printable ASCII file
+        target_size = 25 * 1024 * 1024
+        with open(large_file, "wb") as f:
+            f.write(b"MZ\x90\x90" + b"This is a large string binary payload test. " * 50)
+            f.seek(target_size - 1)
+            f.write(b"\x00")
+
+        with patch("reversecore_mcp.tools.analysis.die_tools.get_config") as mock_cfg:
+            cfg = MagicMock()
+            cfg.lief_max_file_size = 100 * 1024 * 1024
+            cfg.detect_packer_max_scan_size = 5 * 1024 * 1024
+            mock_cfg.return_value = cfg
+
+            res = await detect_packer(str(large_file))
+            assert res.status == "success"
+            data = res.data
+
+            prov = data.get("provenance")
+            assert prov is not None
+            assert prov["is_sampled"] is True
+            assert prov["scan_policy"] == "bounded_window_sampling"
+            assert prov["total_file_size"] == target_size
+            assert prov["scanned_bytes"] == 5 * 1024 * 1024
+            assert prov["partial_analysis"] is True
+            assert data.get("partial_analysis") == prov
+
+    @pytest.mark.asyncio
+    async def test_detect_packer_deep_provenance_and_strings_sample(self, tmp_path):
+        """detect_packer_deep must include provenance and bounded raw_strings_sample."""
+        sample_file = tmp_path / "sample.exe"
+        sample_file.write_bytes(b"MZ\x90\x90" + b"Some readable string in the file. " * 100)
+
+        res = await detect_packer_deep(str(sample_file))
+        assert res.status == "success"
+        data = res.data
+        assert "provenance" in data
+        assert data["provenance"]["is_sampled"] is False
+        assert "raw_strings_sample" in data
+        assert len(data["raw_strings_sample"]) <= 2000
+        assert "Some readable string" in data["raw_strings_sample"]

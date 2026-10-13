@@ -151,6 +151,46 @@ def _extract_sections(binary: Any) -> list[dict[str, Any]]:
     return sections
 
 
+def _check_dyn_flag(entry: Any, expected_flag: Any, bitmask: int) -> bool:
+    """Check whether a dynamic flags entry contains an eager-binding flag."""
+    if entry is None:
+        return False
+
+    # 1. LIEF has() method (e.g. DynamicEntryFlags.has())
+    if hasattr(entry, "has") and callable(entry.has) and expected_flag is not None:
+        try:
+            if entry.has(expected_flag):
+                return True
+        except Exception:
+            pass
+
+    # 2. Check flags attribute or entry directly (iterable / __contains__)
+    flags_val = getattr(entry, "flags", entry)
+    if flags_val is not None:
+        if hasattr(flags_val, "__contains__") and expected_flag is not None:
+            try:
+                if expected_flag in flags_val:
+                    return True
+            except Exception:
+                pass
+        if isinstance(flags_val, (list, tuple, set)):
+            for f in flags_val:
+                if (
+                    f == expected_flag
+                    or str(f).endswith("BIND_NOW")
+                    or str(f).endswith(".NOW")
+                    or f == bitmask
+                ):
+                    return True
+
+    # 3. Bitwise mask check on integer value
+    val = getattr(entry, "value", entry if isinstance(entry, int) else None)
+    if isinstance(val, int) and (val & bitmask) != 0:
+        return True
+
+    return False
+
+
 def _extract_mitigations(binary: Any) -> dict[str, Any]:
     """Extract exploit mitigations from binary."""
     mitigations: dict[str, Any] = {
@@ -166,7 +206,7 @@ def _extract_mitigations(binary: Any) -> dict[str, Any]:
     try:
         import lief
 
-        # Resolve enum classes safely across LIEF versions (0.13 - 0.16+)
+        # Resolve enum classes safely across LIEF versions (0.13 - 0.17+)
         elf_dyn_tags = getattr(
             lief.ELF,
             "DYNAMIC_TAGS",
@@ -175,6 +215,11 @@ def _extract_mitigations(binary: Any) -> dict[str, Any]:
         elf_dyn_flags = getattr(
             lief.ELF,
             "DYNAMIC_FLAGS",
+            getattr(getattr(lief.ELF, "DynamicEntryFlags", None), "FLAG", None),
+        )
+        elf_dyn_flags_1 = getattr(
+            lief.ELF,
+            "DYNAMIC_FLAGS_1",
             getattr(getattr(lief.ELF, "DynamicEntryFlags", None), "FLAG", None),
         )
         elf_seg_types = getattr(
@@ -208,21 +253,84 @@ def _extract_mitigations(binary: Any) -> dict[str, Any]:
                         has_relro = True
 
             try:
-                flags_tag = (
-                    getattr(elf_dyn_tags, "FLAGS", None) if elf_dyn_tags is not None else None
+                dyn_entry_cls = getattr(lief.ELF, "DynamicEntry", None)
+                typed_dyn_tags = getattr(dyn_entry_cls, "TAG", None)
+                dyn_flags_cls = getattr(lief.ELF, "DynamicEntryFlags", None)
+                typed_dyn_flags = getattr(dyn_flags_cls, "FLAG", None)
+
+                flags_tag = getattr(elf_dyn_tags, "FLAGS", None) or getattr(
+                    typed_dyn_tags, "FLAGS", None
                 )
-                if flags_tag is not None and binary.has(cast(Any, flags_tag)):
-                    flags = binary.get(cast(Any, flags_tag))
-                    if elf_dyn_flags is not None:
-                        bind_now_flag = getattr(elf_dyn_flags, "BIND_NOW", None)
-                        flags_val = getattr(flags, "flags", flags)
-                        if (
-                            bind_now_flag is not None
-                            and flags_val is not None
-                            and hasattr(flags_val, "__contains__")
-                        ):
-                            if bind_now_flag in flags_val:
+                flags_1_tag = getattr(elf_dyn_tags, "FLAGS_1", None) or getattr(
+                    typed_dyn_tags, "FLAGS_1", None
+                )
+                bind_now_tag = getattr(elf_dyn_tags, "BIND_NOW", None) or getattr(
+                    typed_dyn_tags, "BIND_NOW", None
+                )
+
+                bind_now_flag = getattr(elf_dyn_flags, "BIND_NOW", None) or getattr(
+                    typed_dyn_flags, "BIND_NOW", None
+                )
+                now_flag = (
+                    getattr(elf_dyn_flags_1, "NOW", None)
+                    or getattr(elf_dyn_flags, "NOW", None)
+                    or getattr(typed_dyn_flags, "NOW", None)
+                )
+
+                # 1. Standalone DT_BIND_NOW dynamic tag
+                if bind_now_tag is not None and hasattr(binary, "has"):
+                    try:
+                        if binary.has(cast(Any, bind_now_tag)):
+                            has_bind_now = True
+                    except Exception:
+                        pass
+
+                # 2. DT_FLAGS with DF_BIND_NOW (0x8)
+                if not has_bind_now and flags_tag is not None and hasattr(binary, "has"):
+                    try:
+                        if binary.has(cast(Any, flags_tag)):
+                            flags_entry = binary.get(cast(Any, flags_tag))
+                            if _check_dyn_flag(flags_entry, bind_now_flag, bitmask=0x8):
                                 has_bind_now = True
+                    except Exception:
+                        pass
+
+                # 3. DT_FLAGS_1 with DF_1_NOW (0x1)
+                if not has_bind_now and flags_1_tag is not None and hasattr(binary, "has"):
+                    try:
+                        if binary.has(cast(Any, flags_1_tag)):
+                            flags_1_entry = binary.get(cast(Any, flags_1_tag))
+                            if _check_dyn_flag(flags_1_entry, now_flag, bitmask=0x1):
+                                has_bind_now = True
+                    except Exception:
+                        pass
+
+                # 4. Fallback search across dynamic_entries if present
+                if not has_bind_now and hasattr(binary, "dynamic_entries"):
+                    try:
+                        for entry in binary.dynamic_entries:
+                            etag = getattr(entry, "tag", None)
+                            if (
+                                (bind_now_tag is not None and etag == bind_now_tag)
+                                or str(etag).endswith("BIND_NOW")
+                                or etag == 24
+                            ):
+                                has_bind_now = True
+                                break
+                            if (
+                                (flags_tag is not None and etag == flags_tag)
+                                or str(etag).endswith(".FLAGS")
+                            ) and _check_dyn_flag(entry, bind_now_flag, bitmask=0x8):
+                                has_bind_now = True
+                                break
+                            if (
+                                (flags_1_tag is not None and etag == flags_1_tag)
+                                or str(etag).endswith("FLAGS_1")
+                            ) and _check_dyn_flag(entry, now_flag, bitmask=0x1):
+                                has_bind_now = True
+                                break
+                    except Exception:
+                        pass
             except Exception:  # nosec B110
                 pass
 
@@ -230,6 +338,8 @@ def _extract_mitigations(binary: Any) -> dict[str, Any]:
                 mitigations["relro"] = "Full"
             elif has_relro:
                 mitigations["relro"] = "Partial"
+            else:
+                mitigations["relro"] = "None"
 
         elif isinstance(binary, lief.PE.Binary):
             has_opt = bool(getattr(binary, "has_opt_header", hasattr(binary, "optional_header")))

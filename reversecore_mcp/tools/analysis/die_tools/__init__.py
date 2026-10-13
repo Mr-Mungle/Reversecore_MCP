@@ -8,6 +8,7 @@ and zero-dependency pure Python PE/ELF header fallbacks.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import re
 import shutil
@@ -47,6 +48,108 @@ from reversecore_mcp.tools.analysis.die_tools.signatures import (
 )
 
 logger = get_logger(__name__)
+
+
+@functools.lru_cache(maxsize=1)
+def _get_compiled_packer_signatures() -> list[tuple[re.Pattern[bytes], str]]:
+    return [
+        (re.compile(p.encode("ascii"), re.IGNORECASE), label) for p, label in _PACKER_SIGNATURES
+    ]
+
+
+@functools.lru_cache(maxsize=1)
+def _get_compiled_compiler_signatures() -> list[tuple[re.Pattern[bytes], str]]:
+    return [
+        (re.compile(p.encode("ascii"), re.IGNORECASE), label) for p, label in _COMPILER_SIGNATURES
+    ]
+
+
+def _read_binary_sample(validated_path: Path, max_bytes: int) -> tuple[bytes, int, bool]:
+    """Read binary data up to max_bytes with support for mocked Paths in unit tests."""
+    file_size = 0
+    try:
+        st = validated_path.stat()
+        file_size = getattr(st, "st_size", 0)
+        if not isinstance(file_size, int):
+            file_size = 0
+    except Exception:
+        file_size = 0
+
+    is_sampled = bool(file_size > max_bytes) if file_size > 0 else False
+    read_len = max_bytes if is_sampled else -1
+
+    # Standard real Path objects: use streaming bounded read
+    if isinstance(validated_path, Path) and "Mock" not in type(validated_path).__name__:
+        with open(validated_path, "rb") as f:
+            read_data = f.read(read_len)
+            actual_size = file_size if file_size > 0 else len(read_data)
+            return read_data, actual_size, is_sampled
+
+    # Mocked Path in unit tests
+    raw_bytes: Any = validated_path.read_bytes()
+    mock_data = bytes(raw_bytes) if isinstance(raw_bytes, (bytes, bytearray)) else b""
+    actual_size = file_size if file_size > 0 else len(mock_data)
+    is_sampled = bool(actual_size > max_bytes)
+    if is_sampled:
+        mock_data = bytes(mock_data[:max_bytes])
+    return mock_data, actual_size, is_sampled
+
+
+def _scan_signatures_chunked(
+    data: bytes,
+    chunk_size: int = 2 * 1024 * 1024,
+    overlap: int = 4096,
+) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+    """Scan byte data in chunks with overlap for known packer and compiler signatures.
+
+    Returns:
+        (found_packers_list, found_compilers_list, detections)
+    """
+    found_packers: list[str] = []
+    found_compilers: list[str] = []
+    detections: list[dict[str, Any]] = []
+    seen_packers: set[str] = set()
+    seen_compilers: set[str] = set()
+
+    packer_patterns = _get_compiled_packer_signatures()
+    compiler_patterns = _get_compiled_compiler_signatures()
+
+    total_len = len(data)
+    step = max(chunk_size - overlap, 1)
+
+    for start in range(0, total_len, step):
+        end = min(start + chunk_size, total_len)
+        chunk = data[start:end]
+
+        for regex, label in packer_patterns:
+            if label not in seen_packers and regex.search(chunk):
+                seen_packers.add(label)
+                found_packers.append(label)
+                detections.append({"type": "packer", "value": label})
+
+        for regex, label in compiler_patterns:
+            if label not in seen_compilers and regex.search(chunk):
+                seen_compilers.add(label)
+                found_compilers.append(label)
+                detections.append({"type": "compiler", "value": label})
+
+        if end >= total_len:
+            break
+
+    return found_packers, found_compilers, detections
+
+
+def _extract_strings_sample(data: bytes, max_chars: int = 2000) -> str:
+    """Extract up to max_chars printable ASCII characters without whole-file allocation."""
+    collected: list[str] = []
+    curr_len = 0
+    for m in re.finditer(rb"[ -~]{4,}", data):
+        s = m.group().decode("ascii", errors="ignore")
+        collected.append(s)
+        curr_len += len(s) + 1
+        if curr_len >= max_chars:
+            break
+    return " ".join(collected)[:max_chars]
 
 
 def _run_diec_cli_if_available(file_path: Path) -> dict[str, Any] | None:
@@ -312,8 +415,9 @@ async def detect_packer(file_path: str) -> ToolResult:
     except (OSError, AttributeError):
         pass
 
+    max_scan_size = getattr(get_config(), "detect_packer_max_scan_size", 20 * 1024 * 1024)
     try:
-        data = validated_path.read_bytes()
+        data, file_size, is_sampled = _read_binary_sample(validated_path, max_scan_size)
     except OSError as exc:
         return failure("FILE_READ_ERROR", f"Cannot read file: {exc}")
 
@@ -324,35 +428,17 @@ async def detect_packer(file_path: str) -> ToolResult:
     # 2. Structural & LIEF / Fallback Analysis
     lief_info = _analyze_binary_with_lief(validated_path, data=data)
 
-    # 3. String & Signature Scanning
-    ascii_strings = b" ".join(m.group() for m in re.finditer(rb"[ -~]{4,}", data)).decode(
-        "ascii", errors="ignore"
-    )
+    # 3. String & Signature Scanning (chunked byte scan)
+    found_packers_list, found_compilers_list, detections = _scan_signatures_chunked(data)
 
     found_packer = lief_info["packer_from_sections"]
-    found_packers_list: list[str] = []
     if found_packer:
-        found_packers_list.append(found_packer)
+        if found_packer not in found_packers_list:
+            found_packers_list.insert(0, found_packer)
+    elif found_packers_list:
+        found_packer = found_packers_list[0]
 
-    found_compiler = None
-    found_compilers_list: list[str] = []
-    detections: list[dict[str, Any]] = []
-
-    for pattern, label in _PACKER_SIGNATURES:
-        if re.search(pattern, ascii_strings, re.IGNORECASE):
-            if label not in found_packers_list:
-                found_packers_list.append(label)
-            if not found_packer:
-                found_packer = label
-            detections.append({"type": "packer", "value": label})
-
-    for pattern, label in _COMPILER_SIGNATURES:
-        if re.search(pattern, ascii_strings, re.IGNORECASE):
-            if label not in found_compilers_list:
-                found_compilers_list.append(label)
-            if not found_compiler:
-                found_compiler = label
-            detections.append({"type": "compiler", "value": label})
+    found_compiler = found_compilers_list[0] if found_compilers_list else None
 
     # Optional diec CLI enhancement
     diec_res = await asyncio.to_thread(_run_diec_cli_if_available, validated_path)
@@ -409,6 +495,15 @@ async def detect_packer(file_path: str) -> ToolResult:
         {"name": p, "type": "packer", "confidence": confidence} for p in found_packers_list
     ]
 
+    provenance: dict[str, Any] = {
+        "is_sampled": is_sampled,
+        "scan_policy": "bounded_window_sampling" if is_sampled else "full",
+        "total_file_size": file_size,
+        "max_scan_size": max_scan_size,
+        "scanned_bytes": len(data),
+        "partial_analysis": is_sampled,
+    }
+
     result = {
         "file_path": str(validated_path),
         "file_type": lief_info["file_type"],
@@ -430,11 +525,15 @@ async def detect_packer(file_path: str) -> ToolResult:
         "overlay": overlay_info,
         "reasons": scoring["reasons"],
         "detections": detections,
+        "provenance": provenance,
+        "partial_analysis": provenance,
     }
 
     message_parts = [
         f"Detected: {result['file_type'] or 'Unknown'} ({result['arch'] or 'Unknown'})"
     ]
+    if is_sampled:
+        message_parts.append(f"Sampled: {len(data)}/{file_size} bytes")
     if found_packer:
         message_parts.append(f"Packer: {found_packer} ({packer_category})")
     elif is_packed:
@@ -478,8 +577,9 @@ async def detect_packer_deep(file_path: str) -> ToolResult:
     except (OSError, AttributeError):
         pass
 
+    max_scan_size = getattr(get_config(), "detect_packer_max_scan_size", 20 * 1024 * 1024)
     try:
-        data = validated_path.read_bytes()
+        data, file_size, is_sampled = _read_binary_sample(validated_path, max_scan_size)
     except OSError as exc:
         return failure("FILE_READ_ERROR", f"Cannot read file: {exc}")
 
@@ -512,11 +612,8 @@ async def detect_packer_deep(file_path: str) -> ToolResult:
     # 2. Structural & Section Analysis
     lief_info = _analyze_binary_with_lief(validated_path, data=data)
 
-    # 3. String & Signature Scanning
-    ascii_strings = b" ".join(m.group() for m in re.finditer(rb"[ -~]{4,}", data)).decode(
-        "ascii", errors="ignore"
-    )
-
+    # 3. String & Signature Scanning (chunked byte scan)
+    raw_packers, raw_compilers, _ = _scan_signatures_chunked(data)
     detections: list[dict[str, Any]] = []
     found_packers: set[str] = set()
     found_compilers: set[str] = set()
@@ -525,15 +622,13 @@ async def detect_packer_deep(file_path: str) -> ToolResult:
         found_packers.add(lief_info["packer_from_sections"])
         detections.append({"type": "packer_section", "value": lief_info["packer_from_sections"]})
 
-    for pattern, label in _PACKER_SIGNATURES:
-        if re.search(pattern, ascii_strings, re.IGNORECASE):
-            found_packers.add(label)
-            detections.append({"type": "packer_signature", "value": label})
+    for label in raw_packers:
+        found_packers.add(label)
+        detections.append({"type": "packer_signature", "value": label})
 
-    for pattern, label in _COMPILER_SIGNATURES:
-        if re.search(pattern, ascii_strings, re.IGNORECASE):
-            found_compilers.add(label)
-            detections.append({"type": "compiler_signature", "value": label})
+    for label in raw_compilers:
+        found_compilers.add(label)
+        detections.append({"type": "compiler_signature", "value": label})
 
     # Optional diec CLI integration
     diec_res = await asyncio.to_thread(_run_diec_cli_if_available, validated_path)
@@ -605,15 +700,32 @@ async def detect_packer_deep(file_path: str) -> ToolResult:
         "all_sections_analysis": lief_info.get("sections", []),
         "section_anomalies": section_anomalies,
         "overlay": overlay_info,
-        "raw_strings_sample": ascii_strings[:2000],
+        "raw_strings_sample": _extract_strings_sample(data, max_chars=2000),
         "reasons": scoring["reasons"],
         "detections": detections,
+        "provenance": {
+            "is_sampled": is_sampled,
+            "scan_policy": "bounded_window_sampling" if is_sampled else "full",
+            "total_file_size": file_size,
+            "max_scan_size": max_scan_size,
+            "scanned_bytes": len(data),
+            "partial_analysis": is_sampled,
+        },
+        "partial_analysis": {
+            "is_sampled": is_sampled,
+            "scan_policy": "bounded_window_sampling" if is_sampled else "full",
+            "total_file_size": file_size,
+            "max_scan_size": max_scan_size,
+            "scanned_bytes": len(data),
+            "partial_analysis": is_sampled,
+        },
     }
 
+    sample_notice = f" (Sampled {len(data)}/{file_size} bytes)" if is_sampled else ""
     return success(
         data=result,
         message=(
-            f"Deep scan complete: {len(detections)} signatures, "
+            f"Deep scan complete{sample_notice}: {len(detections)} signatures, "
             f"{len(lief_info['high_entropy_sections'])} high-entropy sections, "
             f"{len(section_anomalies)} anomalies, confidence={confidence:.2f}"
         ),
