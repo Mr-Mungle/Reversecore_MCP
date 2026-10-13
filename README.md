@@ -176,11 +176,11 @@ Every tool returns a structured `ToolResult` — either a `ToolSuccess` with typ
 
 | Profile | Registered Tools | Schema Size | LLM Context Saving vs Full | Recommended Domain |
 |---|:---:|:---:|:---:|---|
-| `full` | **151** | 112.6 KB | Baseline (0%) | Complete enterprise reverse engineering suite |
-| `vuln-research` | **103** | 70.2 KB | **-37.7%** (~10,800 tokens) | Fuzzing, ASan crash triage, CVE hunting, exploit research |
-| `static` | **97** | 64.8 KB | **-42.5%** (~12,200 tokens) | Disassembly, decompilation (r2ghidra), LIEF, static triage |
-| `malware` | **65** | 59.4 KB | **-47.2%** (~13,600 tokens) | Threat triage, YARA scanning, deobfuscation, anti-analysis |
-| `forensics` | **57** | 36.4 KB | **-67.7%** (~19,500 tokens) | Memory forensics (Volatility3), network PCAP (Scapy), disk |
+| `full` | **153** | 116.8 KB | Baseline (0%) | Complete enterprise reverse engineering suite |
+| `vuln-research` | **105** | 73.3 KB | **-37.2%** (~10,800 tokens) | Fuzzing, ASan crash triage, CVE hunting, exploit research |
+| `static` | **99** | 67.7 KB | **-42.0%** (~12,200 tokens) | Disassembly, decompilation (r2ghidra), LIEF, static triage |
+| `malware` | **67** | 62.8 KB | **-46.2%** (~13,500 tokens) | Threat triage, YARA scanning, deobfuscation, anti-analysis |
+| `forensics` | **57** | 37.0 KB | **-68.4%** (~19,500 tokens) | Memory forensics (Volatility3), network PCAP (Scapy), disk |
 
 ---
 

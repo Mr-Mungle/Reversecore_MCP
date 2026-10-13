@@ -13,10 +13,10 @@ To optimize LLM context usage and minimize token consumption, tools are organize
 
 | Profile | Tools | Primary Focus | Included Plugins |
 |---|:---:|---|---|
-| `full` | **151** | Complete All-in-One Suite (Default) | All plugins |
-| `static` | **97** | Reverse Engineering & Decompilation | `analysis`, `common`, `radare2`, `report`, `server` |
-| `vuln-research` | **103** | Vulnerability Hunting & Exploitation | `analysis`, `source_auditor`, `cve_hunter`, `radare2`, `common`, `report`, `server` |
-| `malware` | **65** | Threat Triage & Malware Analysis | `analysis`, `common`, `malware`, `deobfuscation`, `report`, `server` |
+| `full` | **153** | Complete All-in-One Suite (Default) | All plugins |
+| `static` | **99** | Reverse Engineering & Decompilation | `analysis`, `common`, `radare2`, `report`, `server` |
+| `vuln-research` | **105** | Vulnerability Hunting & Exploitation | `analysis`, `source_auditor`, `cve_hunter`, `radare2`, `common`, `report`, `server` |
+| `malware` | **67** | Threat Triage & Malware Analysis | `analysis`, `common`, `malware`, `deobfuscation`, `report`, `server` |
 | `forensics` | **57** | Digital & Memory Forensics | `forensics`, `memory`, `common`, `report`, `server` |
 
 📊 *For empirical context token savings, cold-start latency, and memory benchmarks across profiles, see [Profile Footprint Benchmark](benchmarks/profile_footprint.md).*
