@@ -152,6 +152,12 @@ class Settings(BaseSettings):
         alias="REVERSECORE_ANTI_ANALYSIS_MAX_SCAN_SIZE",
         description="Maximum bytes scanned during anti-analysis raw byte scanning",
     )
+    detect_packer_max_scan_size: int = Field(
+        default=20 * 1024 * 1024,
+        ge=64 * 1024,
+        alias="REVERSECORE_DETECT_PACKER_MAX_SCAN_SIZE",
+        description="Maximum bytes scanned during detect_packer string and signature analysis",
+    )
 
     # Transport configuration
     host: str = Field(
@@ -582,6 +588,10 @@ class Config:
     @property
     def anti_analysis_max_scan_size(self) -> int:
         return self._settings.anti_analysis_max_scan_size
+
+    @property
+    def detect_packer_max_scan_size(self) -> int:
+        return self._settings.detect_packer_max_scan_size
 
     @property
     def host(self) -> str:

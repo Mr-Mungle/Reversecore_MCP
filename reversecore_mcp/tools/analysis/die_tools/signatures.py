@@ -175,16 +175,26 @@ def compute_packing_heuristic_score(
     # 6. Overlay inspection
     if overlay_info.get("has_overlay"):
         ptype = overlay_info.get("payload_type", "")
-        if ptype == "PyInstaller_Archive":
-            score += 0.60
-            reasons.append("PyInstaller archive detected in binary overlay")
-            packer_category = "bundle_installer"
-        elif ptype in ("Encrypted_or_Compressed_Blob", "Embedded_PE_Binary"):
-            score += 0.30
-            reasons.append(f"Suspicious overlay payload ({ptype})")
-        elif ptype == "Authenticode_Signature":
-            # Legitimate signature - does not increase packer suspicion
-            pass
+        trailing = overlay_info.get("trailing_payload")
+        trailing_type = trailing.get("payload_type") if isinstance(trailing, dict) else None
+
+        check_types = [ptype]
+        if trailing_type and trailing_type not in check_types:
+            check_types.append(trailing_type)
+
+        for t in check_types:
+            if t == "PyInstaller_Archive":
+                score += 0.60
+                reasons.append("PyInstaller archive detected in binary overlay")
+                packer_category = "bundle_installer"
+                break
+            elif t in ("Encrypted_or_Compressed_Blob", "Embedded_PE_Binary"):
+                score += 0.30
+                reasons.append(f"Suspicious overlay payload ({t})")
+                break
+            elif t == "Authenticode_Signature":
+                # Legitimate signature - does not increase packer suspicion
+                pass
 
     # 7. Clean binary suppression
     # If no packer signatures, no suspicious sections, standard compiler present,

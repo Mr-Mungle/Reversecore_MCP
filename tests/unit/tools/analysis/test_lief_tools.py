@@ -27,6 +27,8 @@ if not hasattr(lief.ELF, "DYNAMIC_TAGS"):
 
     class DYNAMIC_TAGS:
         FLAGS = 2
+        FLAGS_1 = 3
+        BIND_NOW = 4
 
     lief.ELF.DYNAMIC_TAGS = DYNAMIC_TAGS
 
@@ -34,6 +36,7 @@ if not hasattr(lief.ELF, "DYNAMIC_FLAGS"):
 
     class DYNAMIC_FLAGS:
         BIND_NOW = 3
+        NOW = 5
 
     lief.ELF.DYNAMIC_FLAGS = DYNAMIC_FLAGS
 
@@ -181,6 +184,115 @@ class TestExtractMitigations:
         assert result["nx"] is False
         assert result["pie"] is False
         assert result["canary"] is False
+        assert result["relro"] == "None"
+
+    def test_extract_mitigations_elf_flags_1_now_full_relro(self):
+        """PT_GNU_RELRO + DT_FLAGS_1 with NOW flag classifies as Full RELRO."""
+        from reversecore_mcp.tools.analysis.lief_tools import _extract_mitigations
+
+        binary = MagicMock(spec=lief.ELF.Binary)
+        binary.has_nx = True
+        binary.is_pie = True
+        binary.imported_symbols = []
+
+        # GNU_RELRO segment present
+        segment = MagicMock()
+        segment.type = getattr(
+            lief.ELF, "SEGMENT_TYPES", getattr(getattr(lief.ELF, "Segment", None), "TYPE", None)
+        ).GNU_RELRO
+        binary.segments = [segment]
+
+        tag_enum = getattr(
+            lief.ELF, "DYNAMIC_TAGS", getattr(getattr(lief.ELF, "DynamicEntry", None), "TAG", None)
+        )
+        flag_enum = getattr(
+            lief.ELF,
+            "DYNAMIC_FLAGS",
+            getattr(getattr(lief.ELF, "DynamicEntryFlags", None), "FLAG", None),
+        )
+        flags_1_tag = getattr(tag_enum, "FLAGS_1", None)
+        now_flag = getattr(flag_enum, "NOW", None)
+
+        def mock_has(tag):
+            return tag == flags_1_tag
+
+        binary.has.side_effect = mock_has
+
+        flags_1_mock = MagicMock()
+        flags_1_mock.flags = [now_flag]
+        flags_1_mock.has.return_value = True
+        flags_1_mock.value = 1
+        binary.get.return_value = flags_1_mock
+
+        result = _extract_mitigations(binary)
+        assert result["relro"] == "Full"
+
+    def test_extract_mitigations_elf_dt_bind_now_tag_full_relro(self):
+        """PT_GNU_RELRO + standalone DT_BIND_NOW tag classifies as Full RELRO."""
+        from reversecore_mcp.tools.analysis.lief_tools import _extract_mitigations
+
+        binary = MagicMock(spec=lief.ELF.Binary)
+        binary.has_nx = False
+        binary.is_pie = False
+        binary.imported_symbols = []
+
+        segment = MagicMock()
+        segment.type = getattr(
+            lief.ELF, "SEGMENT_TYPES", getattr(getattr(lief.ELF, "Segment", None), "TYPE", None)
+        ).GNU_RELRO
+        binary.segments = [segment]
+
+        tag_enum = getattr(
+            lief.ELF, "DYNAMIC_TAGS", getattr(getattr(lief.ELF, "DynamicEntry", None), "TAG", None)
+        )
+        bind_now_tag = getattr(tag_enum, "BIND_NOW", None)
+
+        def mock_has(tag):
+            return tag == bind_now_tag
+
+        binary.has.side_effect = mock_has
+
+        result = _extract_mitigations(binary)
+        assert result["relro"] == "Full"
+
+    def test_extract_mitigations_elf_gnu_relro_without_eager_binding_partial(self):
+        """PT_GNU_RELRO present without any eager-binding flags classifies as Partial RELRO."""
+        from reversecore_mcp.tools.analysis.lief_tools import _extract_mitigations
+
+        binary = MagicMock(spec=lief.ELF.Binary)
+        binary.has_nx = False
+        binary.is_pie = False
+        binary.imported_symbols = []
+
+        segment = MagicMock()
+        segment.type = getattr(
+            lief.ELF, "SEGMENT_TYPES", getattr(getattr(lief.ELF, "Segment", None), "TYPE", None)
+        ).GNU_RELRO
+        binary.segments = [segment]
+        binary.has.return_value = False
+        binary.dynamic_entries = []
+
+        result = _extract_mitigations(binary)
+        assert result["relro"] == "Partial"
+
+    def test_extract_mitigations_elf_now_flags_without_gnu_relro_none(self):
+        """No PT_GNU_RELRO must result in relro='None' regardless of BIND_NOW flags."""
+        from reversecore_mcp.tools.analysis.lief_tools import _extract_mitigations
+
+        binary = MagicMock(spec=lief.ELF.Binary)
+        binary.has_nx = False
+        binary.is_pie = False
+        binary.imported_symbols = []
+        # No segments (no GNU_RELRO)
+        binary.segments = []
+
+        tag_enum = getattr(
+            lief.ELF, "DYNAMIC_TAGS", getattr(getattr(lief.ELF, "DynamicEntry", None), "TAG", None)
+        )
+        bind_now_tag = getattr(tag_enum, "BIND_NOW", None)
+        binary.has.side_effect = lambda t: t == bind_now_tag
+
+        result = _extract_mitigations(binary)
         assert result["relro"] == "None"
 
     def test_extract_mitigations_pe_all_mitigations(self):
