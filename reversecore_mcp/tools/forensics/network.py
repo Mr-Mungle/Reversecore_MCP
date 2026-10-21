@@ -6,7 +6,10 @@ fully container-friendly. Gracefully degrades if Scapy is not installed.
 
 import asyncio
 import collections
+import datetime
+import hashlib
 import re
+from pathlib import Path
 from typing import Any
 
 from reversecore_mcp.core.decorators import log_execution
@@ -15,7 +18,8 @@ from reversecore_mcp.core.exceptions import ValidationError
 from reversecore_mcp.core.logging_config import get_logger
 from reversecore_mcp.core.metrics import track_metrics
 from reversecore_mcp.core.result import ToolResult, failure, success
-from reversecore_mcp.core.security import validate_file_path
+from reversecore_mcp.core.security import get_workspace_config, validate_file_path
+from reversecore_mcp.tools.forensics import _http_summary
 
 logger = get_logger(__name__)
 
@@ -46,6 +50,7 @@ _BEACON_INTERVALS_SEC = [60, 120, 180, 240, 300, 600]
 
 # Minimum packet count per host to consider as beaconing
 _BEACON_MIN_PACKETS = 5
+_STREAM_OUTPUT_MODES = frozenset({"hex", "summary", "file"})
 _TCP_SEQUENCE_MASK = (1 << 32) - 1
 _TCP_SEQUENCE_HALF = 1 << 31
 
@@ -672,6 +677,11 @@ async def pcap_reconstruct_stream(
     max_packets: int = 10000,
     max_bytes: int = 1024 * 1024,  # 1 MB
     src_port: int | None = None,
+    output_mode: str = "hex",
+    max_bytes_c2s: int | None = None,
+    max_bytes_s2c: int | None = None,
+    packet_scope: str = "file",
+    output_dir: str = "streams",
 ) -> ToolResult:
     """Reconstruct TCP stream payload from a PCAP capture.
 
@@ -686,9 +696,25 @@ async def pcap_reconstruct_stream(
         dst_port: Destination TCP port of the stream.
         src_port: Optional source TCP port. If omitted, a source port is inferred
             only when exactly one flow matches the IP addresses and destination port.
-        max_packets: Maximum packets to process (default: 10,000).
+        max_packets: Maximum packets to process (default: 10,000). With
+            ``packet_scope="file"`` this counts packets from the start of the
+            file; with ``packet_scope="flow"`` it counts only packets of the
+            selected flow.
         max_bytes: Maximum unique payload bytes to reconstruct per direction
             (default: 1 MB).
+        output_mode: ``"hex"`` (default) returns up to 4 KB of hex and ASCII per
+            direction. ``"summary"`` returns sizes, SHA-256 and a 256-byte
+            printable preview per direction instead of hex. ``"file"`` also
+            writes each direction's reassembled bytes into ``output_dir`` and
+            returns the file paths, so large streams can be analysed with other
+            tools without passing the bytes through the MCP response.
+        max_bytes_c2s: Optional byte limit for the source-to-destination
+            direction, overriding ``max_bytes``.
+        max_bytes_s2c: Optional byte limit for the destination-to-source
+            direction, overriding ``max_bytes``.
+        packet_scope: ``"file"`` (default) or ``"flow"``. See ``max_packets``.
+        output_dir: Directory for ``output_mode="file"``, relative to the
+            workspace or absolute inside it (default: ``streams``).
 
     Returns:
         ToolResult with separate source-to-destination and reverse streams,
@@ -696,7 +722,9 @@ async def pcap_reconstruct_stream(
         and conflicting overlap counts. The top-level hex and ASCII fields show
         source-to-destination bytes; reverse bytes are in ``reverse_stream``.
         Top-level hex omits missing gap bytes, which are listed in
-        ``forward_stream.gaps``.
+        ``forward_stream.gaps``. In ``file`` mode each direction also carries a
+        ``file`` entry with ``path``, ``bytes``, ``sha256`` and ``gaps`` (file
+        offsets where captured data is missing; no bytes are fabricated).
 
     Example:
         >>> result = await pcap_reconstruct_stream(
@@ -711,8 +739,34 @@ async def pcap_reconstruct_stream(
         isinstance(src_port, bool) or not isinstance(src_port, int) or not 0 <= src_port <= 65535
     ):
         return failure("INVALID_PARAMETER", "src_port must be an integer between 0 and 65535")
+    if output_mode not in _STREAM_OUTPUT_MODES:
+        return failure(
+            "INVALID_PARAMETER",
+            f"output_mode must be one of: {', '.join(sorted(_STREAM_OUTPUT_MODES))}",
+        )
+    if packet_scope not in ("file", "flow"):
+        return failure("INVALID_PARAMETER", "packet_scope must be 'file' or 'flow'")
+    for name, value in (
+        ("max_bytes_c2s", max_bytes_c2s),
+        ("max_bytes_s2c", max_bytes_s2c),
+    ):
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+        ):
+            return failure("INVALID_PARAMETER", f"{name} must be a non-negative integer")
 
     validated = validate_file_path(pcap_path)
+
+    stream_dir: Path | None = None
+    if output_mode == "file":
+        workspace = get_workspace_config().workspace.resolve()
+        requested = Path(output_dir)
+        stream_dir = (requested if requested.is_absolute() else workspace / requested).resolve()
+        if not stream_dir.is_relative_to(workspace):
+            return failure(
+                "PATH_TRAVERSAL_DETECTED",
+                f"output_dir '{output_dir}' must reside within the workspace directory",
+            )
 
     try:
         scapy = _import_scapy()
@@ -724,7 +778,10 @@ async def pcap_reconstruct_stream(
         )
 
     try:
-        packets = await asyncio.to_thread(scapy.rdpcap, str(validated), count=max_packets)
+        if packet_scope == "flow":
+            packets = await asyncio.to_thread(scapy.rdpcap, str(validated))
+        else:
+            packets = await asyncio.to_thread(scapy.rdpcap, str(validated), count=max_packets)
     except Exception as exc:
         return failure("PCAP_PARSE_ERROR", f"Failed to parse PCAP: {exc}")
 
@@ -751,6 +808,8 @@ async def pcap_reconstruct_stream(
         if is_forward_endpoint or is_reverse_endpoint:
             flow_packets.append((pkt, pkt_src, pkt_dst, pkt_sport, pkt_dport))
 
+    flow_packets_truncated = False
+
     if src_port is None and len(candidate_source_ports) > 1:
         return failure(
             "AMBIGUOUS_TCP_FLOW",
@@ -764,6 +823,7 @@ async def pcap_reconstruct_stream(
 
     forward_segments: list[tuple[int, bytes]] = []
     reverse_segments: list[tuple[int, bytes]] = []
+    selected_packet_count = 0
     for pkt, pkt_src, pkt_dst, pkt_sport, pkt_dport in flow_packets:
         is_forward = (
             selected_src_port is not None
@@ -779,7 +839,16 @@ async def pcap_reconstruct_stream(
             and pkt_sport == dst_port
             and pkt_dport == selected_src_port
         )
-        if not (is_forward or is_reverse) or not pkt.haslayer("Raw"):
+        if not (is_forward or is_reverse):
+            continue
+        if packet_scope == "flow":
+            # Count only packets of the selected flow, so max_packets bounds this
+            # flow rather than the whole file.
+            if selected_packet_count >= max_packets:
+                flow_packets_truncated = True
+                break
+            selected_packet_count += 1
+        if not pkt.haslayer("Raw"):
             continue
 
         tcp = pkt["TCP"]
@@ -798,8 +867,13 @@ async def pcap_reconstruct_stream(
         else:
             reverse_segments.append((sequence, payload))
 
-    forward_data = _reassemble_tcp_payloads(forward_segments, max_bytes)
-    reverse_data = _reassemble_tcp_payloads(reverse_segments, max_bytes)
+    forward_data = _reassemble_tcp_payloads(
+        forward_segments, max_bytes if max_bytes_c2s is None else max_bytes_c2s
+    )
+    reverse_data = _reassemble_tcp_payloads(
+        reverse_segments, max_bytes if max_bytes_s2c is None else max_bytes_s2c
+    )
+    include_hex = output_mode == "hex"
 
     def describe_direction(
         direction: str,
@@ -811,26 +885,53 @@ async def pcap_reconstruct_stream(
         assembled: dict[str, Any],
     ) -> dict[str, Any]:
         described_segments = []
-        display_budget = 4096
+        display_budget = 4096 if include_hex else 0
         for segment in assembled["segments"][:1000]:
             payload = segment["payload"]
             display_payload = payload[:display_budget]
             display_budget -= len(display_payload)
-            described_segments.append(
-                {
-                    "sequence_start": segment["sequence_start"],
-                    "sequence_end": segment["sequence_end"],
-                    "payload_bytes": len(payload),
-                    "hex_dump": display_payload.hex(),
-                    "printable_ascii": "".join(
-                        chr(byte) if 32 <= byte < 127 else "." for byte in display_payload
-                    ),
-                    "display_truncated": len(display_payload) < len(payload),
-                }
-            )
+            described = {
+                "sequence_start": segment["sequence_start"],
+                "sequence_end": segment["sequence_end"],
+                "payload_bytes": len(payload),
+            }
+            if include_hex:
+                described.update(
+                    {
+                        "hex_dump": display_payload.hex(),
+                        "printable_ascii": "".join(
+                            chr(byte) if 32 <= byte < 127 else "." for byte in display_payload
+                        ),
+                        "display_truncated": len(display_payload) < len(payload),
+                    }
+                )
+            described_segments.append(described)
         omitted_segments = max(0, len(assembled["segments"]) - len(described_segments))
         omitted_gaps = max(0, len(assembled["gaps"]) - 1000)
+        extra: dict[str, Any] = {}
+        if not include_hex:
+            joined, file_gaps = _join_runs(assembled)
+            extra["sha256"] = hashlib.sha256(joined).hexdigest()
+            extra["preview_printable"] = "".join(
+                chr(byte) if 32 <= byte < 127 else "." for byte in joined[:256]
+            )
+            if stream_dir is not None and joined:
+                endpoint_label = re.sub(
+                    r"[^A-Za-z0-9._-]",
+                    "_",
+                    f"{direction_src_ip}-{direction_src_port}_{direction_dst_ip}-{direction_dst_port}",
+                )
+                stream_dir.mkdir(parents=True, exist_ok=True)
+                file_path = stream_dir / f"{Path(validated).stem}_{endpoint_label}_{direction}.bin"
+                file_path.write_bytes(joined)
+                extra["file"] = {
+                    "path": str(file_path),
+                    "bytes": len(joined),
+                    "sha256": extra["sha256"],
+                    "gaps": file_gaps,
+                }
         return {
+            **extra,
             "direction": direction,
             "src_ip": direction_src_ip,
             "src_port": direction_src_port,
@@ -897,11 +998,15 @@ async def pcap_reconstruct_stream(
             "flow": flow,
             "matching_packets": total_packet_count,
             "payload_bytes": total_payload_bytes,
-            "hex_dump": forward_payload[:4096].hex(),
-            "printable_ascii": printable[:4096],
+            "output_mode": output_mode,
+            "packet_scope": packet_scope,
+            "hex_dump": forward_payload[:4096].hex() if include_hex else "",
+            "printable_ascii": printable[: 4096 if include_hex else 256],
             "forward_stream": forward_stream,
             "reverse_stream": reverse_stream,
-            "truncated": forward_data["truncated"] or reverse_data["truncated"],
+            "truncated": forward_data["truncated"]
+            or reverse_data["truncated"]
+            or flow_packets_truncated,
             **(
                 {
                     "message": "No payload found for the specified TCP flow. Check the IP and port values."
@@ -909,5 +1014,301 @@ async def pcap_reconstruct_stream(
                 if total_payload_bytes == 0
                 else {}
             ),
+        }
+    )
+
+
+_HTTP_SUMMARY_MAX_TRANSACTIONS = 5000
+
+
+def _packet_endpoints(pkt: Any) -> tuple[str, str] | None:
+    """Return (src, dst) addresses for IPv4 or IPv6 packets, else None."""
+    if pkt.haslayer("IP"):
+        layer = pkt["IP"]
+    elif pkt.haslayer("IPv6"):
+        layer = pkt["IPv6"]
+    else:
+        return None
+    return str(layer.src), str(layer.dst)
+
+
+def _join_runs(assembled: dict[str, Any]) -> tuple[bytes, list[dict[str, int]]]:
+    """Concatenate reassembled runs and report where capture gaps fall.
+
+    No bytes are fabricated for gaps; each gap is reported with the offset in
+    the joined output where the missing data would have started.
+    """
+    output = bytearray()
+    gaps: list[dict[str, int]] = []
+    for index, segment in enumerate(assembled["segments"]):
+        if index and index - 1 < len(assembled["gaps"]):
+            gaps.append(
+                {
+                    "file_offset": len(output),
+                    "missing_bytes": assembled["gaps"][index - 1]["missing_bytes"],
+                }
+            )
+        output.extend(segment["payload"])
+    return bytes(output), gaps
+
+
+def _utc_iso(timestamp: float | None) -> str | None:
+    if timestamp is None:
+        return None
+    return datetime.datetime.fromtimestamp(float(timestamp), datetime.timezone.utc).isoformat()
+
+
+def _summarize_http_flows(
+    packets: Any,
+    ports: set[int] | None,
+    watch_fields: list[str],
+    max_bytes_per_direction: int,
+    inspection_window: int,
+    max_transactions: int,
+    max_field_runs: int,
+) -> dict[str, Any]:
+    flows: dict[tuple, dict[str, Any]] = {}
+    for pkt in packets:
+        if not pkt.haslayer("TCP"):
+            continue
+        endpoints = _packet_endpoints(pkt)
+        if endpoints is None:
+            continue
+        src, dst = endpoints
+        tcp = pkt["TCP"]
+        try:
+            sport, dport = int(tcp.sport), int(tcp.dport)
+            sequence, tcp_flags = int(tcp.seq), int(tcp.flags)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        a, b = (src, sport), (dst, dport)
+        key = (a, b) if a <= b else (b, a)
+        flow = flows.setdefault(
+            key,
+            {
+                "segments": {a: [], b: []},
+                "syn_from": None,
+                "rst": False,
+                "first": None,
+                "last": None,
+            },
+        )
+        flow["segments"].setdefault(a, [])
+        timestamp = getattr(pkt, "time", None)
+        if timestamp is not None:
+            timestamp = float(timestamp)
+            flow["first"] = timestamp if flow["first"] is None else min(flow["first"], timestamp)
+            flow["last"] = timestamp if flow["last"] is None else max(flow["last"], timestamp)
+        if tcp_flags & 0x02 and not tcp_flags & 0x10 and flow["syn_from"] is None:
+            flow["syn_from"] = a
+        if tcp_flags & 0x04:
+            flow["rst"] = True
+        if tcp_flags & 0x02:
+            sequence += 1
+        if pkt.haslayer("Raw"):
+            flow["segments"][a].append((sequence, bytes(pkt["Raw"].load)))
+
+    transactions: list[dict[str, Any]] = []
+    totals: collections.Counter[str] = collections.Counter()
+    for key, flow in sorted(flows.items(), key=lambda item: item[1]["first"] or 0.0):
+        totals["tcp_flows"] += 1
+        assembled = {
+            endpoint: _reassemble_tcp_payloads(segments, max_bytes_per_direction)
+            for endpoint, segments in flow["segments"].items()
+        }
+        joined = {endpoint: _join_runs(data) for endpoint, data in assembled.items()}
+
+        client = flow["syn_from"]
+        if client is None or not _http_summary.looks_like_request(joined[client][0]):
+            client = next(
+                (ep for ep, (data, _) in joined.items() if _http_summary.looks_like_request(data)),
+                None,
+            )
+        if client is None:
+            totals["non_http_flows"] += 1
+            continue
+        server = key[1] if key[0] == client else key[0]
+        if ports and server[1] not in ports:
+            totals["filtered_flows"] += 1
+            continue
+        totals["http_flows"] += 1
+
+        client_data, client_gaps = joined[client]
+        server_data, server_gaps = joined.get(server, (b"", []))
+        requests = _http_summary.parse_http_messages(client_data, "request")
+        methods = [message["start_line"].split(" ", 1)[0] for message in requests]
+        responses = (
+            _http_summary.parse_http_messages(server_data, "response", methods)
+            if _http_summary.looks_like_response(server_data)
+            else []
+        )
+
+        for index, request_message in enumerate(requests):
+            totals["transactions"] += 1
+            if len(transactions) >= max_transactions:
+                totals["transactions_omitted"] += 1
+                continue
+            request = _http_summary.describe_request(
+                client_data, request_message, watch_fields, max_field_runs
+            )
+            response = (
+                _http_summary.describe_response(responses[index])
+                if index < len(responses)
+                else None
+            )
+            flags: list[str] = []
+            if response is None:
+                flags.append("no_response")
+                totals["no_response"] += 1
+            elif response["set_cookie_anomalies"]:
+                flags.append("anomalous_set_cookie")
+                totals["anomalous_set_cookie"] += 1
+            if flow["rst"]:
+                flags.append("connection_reset")
+            if not request["complete"]:
+                flags.append("request_incomplete_in_capture")
+            if client_gaps or server_gaps:
+                flags.append("capture_gaps")
+            deep_fields = [
+                name
+                for name, offset in request.get("multipart", {})
+                .get("watched_field_offsets", {})
+                .items()
+                if offset is not None and offset >= inspection_window
+            ]
+            if deep_fields:
+                flags.append("watched_field_beyond_inspection_window")
+                request["fields_beyond_inspection_window"] = deep_fields
+
+            transactions.append(
+                {
+                    "client": f"{client[0]}:{client[1]}",
+                    "server": f"{server[0]}:{server[1]}",
+                    "first_seen": _utc_iso(flow["first"]),
+                    "last_seen": _utc_iso(flow["last"]),
+                    "flow_duration_ms": (
+                        round((flow["last"] - flow["first"]) * 1000, 1)
+                        if flow["first"] is not None and flow["last"] is not None
+                        else None
+                    ),
+                    "request": request,
+                    "response": response,
+                    "flags": flags,
+                }
+            )
+
+    return {"transactions": transactions, "totals": dict(totals)}
+
+
+@log_execution(tool_name="pcap_http_summary")
+@track_metrics("pcap_http_summary")
+@handle_tool_errors
+async def pcap_http_summary(
+    pcap_path: str,
+    max_packets: int = 200000,
+    ports: list[int] | None = None,
+    watch_fields: list[str] | None = None,
+    inspection_window: int = 100 * 1024,
+    max_bytes_per_direction: int = 64 * 1024 * 1024,
+    max_transactions: int = 500,
+    max_field_runs: int = 20,
+) -> ToolResult:
+    """Summarize HTTP/1.x requests and responses in a PCAP without returning payload bytes.
+
+    Reassembles every TCP flow, splits it into HTTP transactions and reports the
+    shape of each one: request line, selected headers, body sizes, multipart
+    field structure, response status and headers. Field values and bodies are
+    never returned, so captures with very large requests stay cheap to triage.
+
+    Each transaction carries flags for common investigation signals:
+    ``no_response`` (the server sent nothing back, for example a crashed
+    worker), ``anomalous_set_cookie`` (a Set-Cookie value that decodes to
+    binary or heavily percent-encoded data, a sign of reflected memory),
+    ``connection_reset``, ``request_incomplete_in_capture``, ``capture_gaps``
+    and ``watched_field_beyond_inspection_window``.
+
+    Args:
+        pcap_path: Path to a PCAP or PCAPNG capture file.
+        max_packets: Maximum packets to read from the file (default: 200,000).
+        ports: Only report flows whose server port is in this list. Default: all ports.
+        watch_fields: Multipart form-field names whose byte offset in the body
+            should be reported, for example ``["PHP_SESSION_UPLOAD_PROGRESS"]``.
+        inspection_window: Body offset in bytes beyond which a watched field is
+            flagged (default: 102,400, Suricata's default request-body-limit).
+        max_bytes_per_direction: Maximum bytes reassembled per flow direction
+            (default: 64 MB). Larger bodies are measured as incomplete.
+        max_transactions: Maximum transactions returned (default: 500, max 5,000).
+        max_field_runs: Maximum run-length entries per multipart summary (default: 20).
+
+    Returns:
+        ToolResult with ``transactions`` (one entry per HTTP request, paired with
+        its response when present) and ``totals`` (flow and flag counts).
+
+    Example:
+        >>> result = await pcap_http_summary(
+        ...     "/app/workspace/capture.pcap",
+        ...     watch_fields=["PHP_SESSION_UPLOAD_PROGRESS"],
+        ... )
+    """
+    for name, value, minimum in (
+        ("max_packets", max_packets, 1),
+        ("inspection_window", inspection_window, 0),
+        ("max_bytes_per_direction", max_bytes_per_direction, 1),
+        ("max_transactions", max_transactions, 1),
+        ("max_field_runs", max_field_runs, 1),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            return failure("INVALID_PARAMETER", f"{name} must be an integer >= {minimum}")
+    if max_transactions > _HTTP_SUMMARY_MAX_TRANSACTIONS:
+        return failure(
+            "INVALID_PARAMETER",
+            f"max_transactions must not exceed {_HTTP_SUMMARY_MAX_TRANSACTIONS}",
+        )
+    port_filter: set[int] | None = None
+    if ports:
+        if any(
+            isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535
+            for port in ports
+        ):
+            return failure("INVALID_PARAMETER", "ports must contain integers between 0 and 65535")
+        port_filter = set(ports)
+    fields = [str(field) for field in (watch_fields or [])]
+
+    validated = validate_file_path(pcap_path)
+
+    try:
+        scapy = _import_scapy()
+    except ImportError:
+        return failure(
+            "DEPENDENCY_MISSING",
+            "Scapy is not installed",
+            hint="Install with: pip install scapy",
+        )
+
+    try:
+        packets = await asyncio.to_thread(scapy.rdpcap, str(validated), count=max_packets)
+    except Exception as exc:
+        return failure("PCAP_PARSE_ERROR", f"Failed to parse PCAP: {exc}")
+
+    summary = await asyncio.to_thread(
+        _summarize_http_flows,
+        packets,
+        port_filter,
+        fields,
+        max_bytes_per_direction,
+        inspection_window,
+        max_transactions,
+        max_field_runs,
+    )
+
+    return success(
+        {
+            "pcap_path": str(validated),
+            "packets_read": len(packets),
+            "packets_truncated": len(packets) >= max_packets,
+            "watch_fields": fields,
+            "inspection_window": inspection_window,
+            "totals": summary["totals"],
+            "transactions": summary["transactions"],
         }
     )

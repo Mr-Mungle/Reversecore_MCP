@@ -297,6 +297,7 @@ TOOL_PLUGIN_MAP: dict[str, str] = {
     "pcap_extract_dns": "forensics_tools",
     "pcap_extract_c2": "forensics_tools",
     "pcap_reconstruct_stream": "forensics_tools",
+    "pcap_http_summary": "forensics_tools",
     "disk_list_partition": "forensics_tools",
     "disk_list_files": "forensics_tools",
     "disk_analyze_mft": "forensics_tools",

@@ -292,3 +292,56 @@ class TestCreateDirectory:
 
         assert result.status == "error"
         assert "traverses outside workspace" in result.message
+
+
+class TestListWorkspaceBounds:
+    """Tests for list_workspace pattern, depth and limit handling."""
+
+    @staticmethod
+    def _run(workspace, **kwargs):
+        from reversecore_mcp.tools.common.file_operations import list_workspace
+
+        with patch("reversecore_mcp.tools.common.file_operations.get_config") as mock_get_config:
+            mock_config = MagicMock()
+            mock_config.workspace = workspace
+            mock_get_config.return_value = mock_config
+            return list_workspace(**kwargs)
+
+    @staticmethod
+    def _tree(tmp_path):
+        workspace = tmp_path / "workspace"
+        (workspace / "PCAPs" / "case1").mkdir(parents=True)
+        (workspace / "src" / "deep" / "deeper").mkdir(parents=True)
+        (workspace / "top.bin").write_bytes(b"1")
+        (workspace / "PCAPs" / "case1" / "a.pcap").write_bytes(b"2")
+        for index in range(5):
+            (workspace / "src" / "deep" / "deeper" / f"f{index}.c").write_bytes(b"3")
+        return workspace
+
+    def test_pattern_matches_at_any_depth(self, tmp_path):
+        result = self._run(self._tree(tmp_path), pattern="*.pcap")
+        assert [f["relative_path"] for f in result.data["files"]] == ["PCAPs/case1/a.pcap"]
+
+    def test_max_depth_one_lists_top_level_only(self, tmp_path):
+        result = self._run(self._tree(tmp_path), max_depth=1)
+        assert [f["relative_path"] for f in result.data["files"]] == ["top.bin"]
+
+    def test_limit_truncates_and_reports_total(self, tmp_path):
+        result = self._run(self._tree(tmp_path), limit=2)
+        assert len(result.data["files"]) == 2
+        assert result.data["total_matched"] == 7
+        assert result.data["truncated"] is True
+
+    def test_invalid_limit_is_rejected(self, tmp_path):
+        result = self._run(self._tree(tmp_path), limit=0)
+        assert result.status == "error"
+
+    def test_invalid_max_depth_and_pattern_are_rejected(self, tmp_path):
+        workspace = self._tree(tmp_path)
+        assert self._run(workspace, max_depth=0).status == "error"
+        assert self._run(workspace, pattern="").status == "error"
+
+    def test_missing_workspace_reports_empty(self, tmp_path):
+        result = self._run(tmp_path / "does-not-exist")
+        assert result.status == "success"
+        assert result.data["files"] == [] and result.data["truncated"] is False

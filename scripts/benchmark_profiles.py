@@ -29,10 +29,10 @@ PROFILES = ["full", "static", "malware", "forensics", "vuln-research"]
 
 # Expected tool counts per profile (derived from plugin memberships + core task queue)
 EXPECTED_PROFILE_TOOL_COUNTS = {
-    "full": 177,
+    "full": 178,
     "static": 123,
     "malware": 91,
-    "forensics": 76,
+    "forensics": 77,
     "vuln-research": 129,
 }
 

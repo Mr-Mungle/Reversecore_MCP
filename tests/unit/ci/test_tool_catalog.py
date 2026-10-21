@@ -117,10 +117,10 @@ def test_profile_benchmark_expectations():
     assert "forensics" in PROFILES
     assert "vuln-research" in PROFILES
 
-    assert EXPECTED_PROFILE_TOOL_COUNTS["full"] == 177
+    assert EXPECTED_PROFILE_TOOL_COUNTS["full"] == 178
     assert EXPECTED_PROFILE_TOOL_COUNTS["static"] == 123
     assert EXPECTED_PROFILE_TOOL_COUNTS["malware"] == 91
-    assert EXPECTED_PROFILE_TOOL_COUNTS["forensics"] == 76
+    assert EXPECTED_PROFILE_TOOL_COUNTS["forensics"] == 77
     assert EXPECTED_PROFILE_TOOL_COUNTS["vuln-research"] == 129
 
 

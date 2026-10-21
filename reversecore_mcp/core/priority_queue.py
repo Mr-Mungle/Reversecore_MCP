@@ -122,7 +122,7 @@ KIND_TOOL_MAP: dict[str, list[str]] = {
     "diff": ["analyze_patch_diff_auto", "r2_decompile", "diff_binaries"],
     "patch": ["analyze_patch_diff_auto", "r2_simulate_patch", "r2_decompile"],
     "memory": ["memory_analyze", "memory_detect_injections", "memory_dump_module"],
-    "pcap": ["pcap_analyze", "pcap_reconstruct_stream", "artifact_correlate_ioc"],
+    "pcap": ["pcap_analyze", "pcap_http_summary", "pcap_reconstruct_stream", "artifact_correlate_ioc"],
     "network": ["pcap_analyze", "pcap_list_connections", "artifact_correlate_ioc"],
     "section": ["run_binwalk", "parse_binary_with_lief", "Radare2_list_sections"],
     "hypothesis": ["get_case_state", "create_analysis_report", "recommend_analysis_plan"],

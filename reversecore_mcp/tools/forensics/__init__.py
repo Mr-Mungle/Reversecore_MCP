@@ -57,6 +57,7 @@ class ForensicsToolsPlugin(Plugin):
             pcap_analyze,
             pcap_extract_c2,
             pcap_extract_dns,
+            pcap_http_summary,
             pcap_list_connections,
             pcap_reconstruct_stream,
         )
@@ -83,6 +84,7 @@ class ForensicsToolsPlugin(Plugin):
         mcp_server.tool(pcap_extract_dns)
         mcp_server.tool(pcap_extract_c2)
         mcp_server.tool(pcap_reconstruct_stream)
+        mcp_server.tool(pcap_http_summary)
 
         # Register artifact correlation tools
         mcp_server.tool(artifact_collect)

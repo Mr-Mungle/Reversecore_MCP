@@ -1,8 +1,10 @@
 """File operation tools for managing workspace and file handling."""
 
+import fnmatch
+import os
 import shutil
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastmcp import Context
 from pydantic import Field
@@ -237,32 +239,71 @@ def copy_to_workspace(
 @log_execution(tool_name="list_workspace")
 @track_metrics("list_workspace")
 @handle_tool_errors
-def list_workspace() -> ToolResult:
+def list_workspace(
+    pattern: str = "*",
+    max_depth: int | None = None,
+    limit: int = 1000,
+) -> ToolResult:
     """
-    List all files in the workspace directory.
+    List files in the workspace directory.
+
+    The listing is bounded so that large workspaces (for example extracted
+    firmware or source trees) cannot produce an oversized response. Narrow it
+    with ``pattern`` and ``max_depth`` and check ``truncated`` in the result.
+
+    Args:
+        pattern: Shell-style pattern matched against each file's path relative
+            to the workspace (default: ``*``, all files). ``*`` also matches
+            ``/``, so ``*.pcap`` finds PCAPs at any depth and ``PCAPs/*`` lists
+            one directory tree.
+        max_depth: Maximum directory depth to descend; 1 lists only the top
+            level. Default: unlimited.
+        limit: Maximum number of files returned (default: 1,000, max 10,000).
 
     Returns:
-        ToolResult with list of files in workspace
+        ToolResult with list of files in workspace, ``total_matched`` and
+        ``truncated``.
     """
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10000:
+        raise ValidationError("limit must be an integer between 1 and 10000")
+    if max_depth is not None and (
+        isinstance(max_depth, bool) or not isinstance(max_depth, int) or max_depth < 1
+    ):
+        raise ValidationError("max_depth must be a positive integer")
+    if not isinstance(pattern, str) or not pattern or any(c in pattern for c in ("\0", "\r", "\n")):
+        raise ValidationError("pattern must be a non-empty string")
+
     config = get_config()
     workspace = config.workspace
 
     if not workspace.exists():
         return success(
-            {"files": [], "message": "Workspace is empty"},
+            {
+                "files": [],
+                "message": "Workspace is empty",
+                "truncated": False,
+                "total_matched": 0,
+            },
             file_count=0,
             workspace_path=str(workspace),
         )
 
-    files = []
-    # Using rglob to list all files in subdirectories as well
-    for item in workspace.rglob("*"):
-        if item.is_file():
-            # Store relative path to make it easier to read
-            try:
-                rel_path = str(item.relative_to(workspace))
-            except ValueError:
-                rel_path = str(item)
+    files: list[dict[str, Any]] = []
+    total_matched = 0
+    for root, dirnames, filenames in os.walk(workspace):
+        root_path = Path(root)
+        depth = len(root_path.relative_to(workspace).parts) + 1
+        dirnames.sort()
+        if max_depth is not None and depth >= max_depth:
+            dirnames[:] = []
+        for filename in sorted(filenames):
+            item = root_path / filename
+            rel_path = item.relative_to(workspace).as_posix()
+            if not fnmatch.fnmatchcase(rel_path, pattern) or not item.is_file():
+                continue
+            total_matched += 1
+            if len(files) >= limit:
+                continue
             files.append(
                 {
                     "name": item.name,
@@ -272,7 +313,14 @@ def list_workspace() -> ToolResult:
                 }
             )
 
-    return success({"files": files}, file_count=len(files), workspace_path=str(workspace))
+    truncated = total_matched > len(files)
+    data = {"files": files, "total_matched": total_matched, "truncated": truncated}
+    if truncated:
+        data["message"] = (
+            f"Showing {len(files)} of {total_matched} files. "
+            "Narrow the listing with pattern or max_depth, or use scan_workspace."
+        )
+    return success(data, file_count=len(files), workspace_path=str(workspace))
 
 
 @log_execution(tool_name="create_directory")

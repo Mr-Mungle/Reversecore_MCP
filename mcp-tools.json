@@ -19722,10 +19722,33 @@
   },
   {
     "name": "list_workspace",
-    "description": "List all files in the workspace directory.\n\nReturns:\n    ToolResult with list of files in workspace",
+    "description": "List files in the workspace directory.\n\nThe listing is bounded so that large workspaces (for example extracted\nfirmware or source trees) cannot produce an oversized response. Narrow it\nwith ``pattern`` and ``max_depth`` and check ``truncated`` in the result.",
     "inputSchema": {
       "additionalProperties": false,
-      "properties": {},
+      "properties": {
+        "pattern": {
+          "default": "*",
+          "type": "string",
+          "description": "Shell-style pattern matched against each file's path relative\nto the workspace (default: ``*``, all files). ``*`` also matches\n``/``, so ``*.pcap`` finds PCAPs at any depth and ``PCAPs/*`` lists\none directory tree."
+        },
+        "max_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Maximum directory depth to descend; 1 lists only the top\nlevel. Default: unlimited."
+        },
+        "limit": {
+          "default": 1000,
+          "type": "integer",
+          "description": "Maximum number of files returned (default: 1,000, max 10,000)."
+        }
+      },
       "type": "object"
     },
     "outputSchema": {
@@ -22456,6 +22479,233 @@
     }
   },
   {
+    "name": "pcap_http_summary",
+    "description": "Summarize HTTP/1.x requests and responses in a PCAP without returning payload bytes.\n\nReassembles every TCP flow, splits it into HTTP transactions and reports the\nshape of each one: request line, selected headers, body sizes, multipart\nfield structure, response status and headers. Field values and bodies are\nnever returned, so captures with very large requests stay cheap to triage.\n\nEach transaction carries flags for common investigation signals:\n``no_response`` (the server sent nothing back, for example a crashed\nworker), ``anomalous_set_cookie`` (a Set-Cookie value that decodes to\nbinary or heavily percent-encoded data, a sign of reflected memory),\n``connection_reset``, ``request_incomplete_in_capture``, ``capture_gaps``\nand ``watched_field_beyond_inspection_window``.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "pcap_path": {
+          "type": "string",
+          "description": "Path to a PCAP or PCAPNG capture file."
+        },
+        "max_packets": {
+          "default": 200000,
+          "type": "integer",
+          "description": "Maximum packets to read from the file (default: 200,000)."
+        },
+        "ports": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Only report flows whose server port is in this list. Default: all ports."
+        },
+        "watch_fields": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Multipart form-field names whose byte offset in the body\nshould be reported, for example ``[\"PHP_SESSION_UPLOAD_PROGRESS\"]``."
+        },
+        "inspection_window": {
+          "default": 102400,
+          "type": "integer",
+          "description": "Body offset in bytes beyond which a watched field is\nflagged (default: 102,400, Suricata's default request-body-limit)."
+        },
+        "max_bytes_per_direction": {
+          "default": 67108864,
+          "type": "integer",
+          "description": "Maximum bytes reassembled per flow direction\n(default: 64 MB). Larger bodies are measured as incomplete."
+        },
+        "max_transactions": {
+          "default": 500,
+          "type": "integer",
+          "description": "Maximum transactions returned (default: 500, max 5,000)."
+        },
+        "max_field_runs": {
+          "default": 20,
+          "type": "integer",
+          "description": "Maximum run-length entries per multipart summary (default: 20)."
+        }
+      },
+      "required": [
+        "pcap_path"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean",
+          "description": "True if operation succeeded, False otherwise"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "success",
+            "error"
+          ]
+        },
+        "data": {
+          "type": [
+            "object",
+            "string",
+            "array",
+            "null"
+          ],
+          "description": "Structured analysis payload on success"
+        },
+        "error": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "code": {
+              "type": "string",
+              "description": "Stable error code (e.g. FILE_NOT_FOUND, VALIDATION_ERROR)"
+            },
+            "message": {
+              "type": "string",
+              "description": "Human-readable explanation"
+            },
+            "retryable": {
+              "type": "boolean",
+              "description": "Whether the caller may retry"
+            },
+            "recovery_hint": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Actionable recovery advice"
+            }
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "metadata": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "meta": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "pagination": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "page": {
+              "type": "integer"
+            },
+            "page_size": {
+              "type": "integer"
+            },
+            "total_items": {
+              "type": "integer"
+            },
+            "total_pages": {
+              "type": "integer"
+            },
+            "has_next": {
+              "type": "boolean"
+            },
+            "has_previous": {
+              "type": "boolean"
+            }
+          }
+        },
+        "truncation": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "truncated": {
+              "type": "boolean"
+            },
+            "returned_bytes": {
+              "type": "integer"
+            },
+            "total_captured_bytes": {
+              "type": "integer"
+            },
+            "saved_artifact": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "continuation": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "offset": {
+                  "type": "integer"
+                },
+                "length": {
+                  "type": "integer"
+                },
+                "cursor": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "recommended_next_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "ok",
+        "status"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
     "name": "pcap_list_connections",
     "description": "List all unique IP/port connections observed in a PCAP capture.",
     "inputSchema": {
@@ -22669,7 +22919,7 @@
         "max_packets": {
           "default": 10000,
           "type": "integer",
-          "description": "Maximum packets to process (default: 10,000)."
+          "description": "Maximum packets to process (default: 10,000). With\n``packet_scope=\"file\"`` this counts packets from the start of the\nfile; with ``packet_scope=\"flow\"`` it counts only packets of the\nselected flow."
         },
         "max_bytes": {
           "default": 1048576,
@@ -22687,6 +22937,45 @@
           ],
           "default": null,
           "description": "Optional source TCP port. If omitted, a source port is inferred\nonly when exactly one flow matches the IP addresses and destination port."
+        },
+        "output_mode": {
+          "default": "hex",
+          "type": "string",
+          "description": "``\"hex\"`` (default) returns up to 4 KB of hex and ASCII per\ndirection. ``\"summary\"`` returns sizes, SHA-256 and a 256-byte\nprintable preview per direction instead of hex. ``\"file\"`` also\nwrites each direction's reassembled bytes into ``output_dir`` and\nreturns the file paths, so large streams can be analysed with other\ntools without passing the bytes through the MCP response."
+        },
+        "max_bytes_c2s": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional byte limit for the source-to-destination\ndirection, overriding ``max_bytes``."
+        },
+        "max_bytes_s2c": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional byte limit for the destination-to-source\ndirection, overriding ``max_bytes``."
+        },
+        "packet_scope": {
+          "default": "file",
+          "type": "string",
+          "description": "``\"file\"`` (default) or ``\"flow\"``. See ``max_packets``."
+        },
+        "output_dir": {
+          "default": "streams",
+          "type": "string",
+          "description": "Directory for ``output_mode=\"file\"``, relative to the\nworkspace or absolute inside it (default: ``streams``)."
         }
       },
       "required": [
